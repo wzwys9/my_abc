@@ -438,14 +438,21 @@ install_docker() {
         # 删除旧版本
         sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
         
+        # 清理可能存在的错误Docker仓库配置
+        log_info "清理旧的Docker仓库配置..."
+        sudo rm -f /etc/apt/sources.list.d/docker.list
+        sudo rm -f /usr/share/keyrings/docker-archive-keyring.gpg
+        
         # 根据系统类型配置Docker仓库
         case "$OS_ID" in
             "ubuntu")
+                log_info "配置Ubuntu Docker仓库..."
                 # Ubuntu系统配置
                 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
                 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
                 ;;
             "debian")
+                log_info "配置Debian Docker仓库..."
                 # Debian系统配置
                 curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
                 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -456,8 +463,26 @@ install_docker() {
                 ;;
         esac
         
-        # 安装Docker
+        # 验证仓库配置
+        log_info "验证Docker仓库配置..."
+        if [[ "$OS_ID" == "debian" ]]; then
+            if ! grep -q "download.docker.com/linux/debian" /etc/apt/sources.list.d/docker.list; then
+                log_error "Docker仓库配置失败"
+                exit 1
+            fi
+        else
+            if ! grep -q "download.docker.com/linux/ubuntu" /etc/apt/sources.list.d/docker.list; then
+                log_error "Docker仓库配置失败"
+                exit 1
+            fi
+        fi
+        
+        # 更新软件包列表
+        log_info "更新软件包列表..."
         sudo apt-get update
+        
+        # 安装Docker
+        log_info "安装Docker软件包..."
         sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
         # 启动Docker服务
