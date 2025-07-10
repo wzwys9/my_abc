@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 全局变量
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.11"
 PROJECT_DIR=""
 DOMAIN=""
 EMAIL=""
