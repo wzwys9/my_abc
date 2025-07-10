@@ -29,6 +29,7 @@ SEAFILE_ADMIN_PASSWORD=""
 OS_ID=""
 OS_VERSION_ID=""
 OS_CODENAME=""
+DOCKER_SUDO=""
 
 # 日志函数
 log_info() {
@@ -492,6 +493,10 @@ install_docker() {
         # 将当前用户添加到docker组
         sudo usermod -aG docker $USER
         
+        # 激活docker组权限（避免需要重新登录）
+        log_info "激活Docker组权限..."
+        newgrp docker
+        
         DOCKER_VERSION=$(docker --version | cut -d ' ' -f3 | cut -d ',' -f1)
         log_success "✅ Docker安装完成: $DOCKER_VERSION"
     fi
@@ -516,10 +521,14 @@ install_docker() {
         log_success "✅ Docker Compose安装完成: $COMPOSE_VERSION"
     fi
     
-    # 测试Docker安装
-    if ! docker --version &>/dev/null; then
-        log_error "Docker安装失败"
-        exit 1
+    # 测试Docker权限
+    log_info "测试Docker权限..."
+    if ! docker ps &>/dev/null; then
+        log_warn "Docker权限需要sudo，将在脚本中使用sudo执行Docker命令"
+        # 设置全局变量指示需要使用sudo
+        DOCKER_SUDO="sudo"
+    else
+        DOCKER_SUDO=""
     fi
     
     # 检查Docker服务状态
@@ -972,7 +981,7 @@ http {
 EOF
 
     # 启动临时nginx容器
-    docker run --rm -d \
+    ${DOCKER_SUDO} docker run --rm -d \
         --name temp-nginx \
         -p 80:80 \
         -v "$(pwd)/temp-nginx.conf:/etc/nginx/nginx.conf" \
@@ -985,7 +994,7 @@ EOF
     # 测试nginx是否正常运行
     if ! curl -s http://localhost >/dev/null; then
         log_error "临时nginx服务器启动失败"
-        docker stop temp-nginx 2>/dev/null || true
+        ${DOCKER_SUDO} docker stop temp-nginx 2>/dev/null || true
         exit 1
     fi
     
@@ -1010,8 +1019,8 @@ EOF
     fi
     
     # 停止临时nginx
-    docker stop temp-nginx 2>/dev/null || true
-    docker rm temp-nginx 2>/dev/null || true
+    ${DOCKER_SUDO} docker stop temp-nginx 2>/dev/null || true
+    ${DOCKER_SUDO} docker rm temp-nginx 2>/dev/null || true
     
     # 清理临时文件
     rm -f temp-nginx.conf
@@ -1041,6 +1050,13 @@ set -e
 LOG_FILE="/var/log/seafile-cert-renewal.log"
 PROJECT_DIR="$HOME/seafile-docker"
 
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
+
 # 日志函数
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
@@ -1056,7 +1072,7 @@ cd "$PROJECT_DIR" || {
 
 # 停止nginx容器以释放80端口
 log "停止nginx容器..."
-if ! docker-compose stop nginx; then
+if ! ${DOCKER_SUDO} docker-compose stop nginx; then
     log "警告: 停止nginx容器失败"
 fi
 
@@ -1067,13 +1083,13 @@ if sudo certbot renew --quiet --deploy-hook "systemctl reload nginx 2>/dev/null 
 else
     log "错误: 证书续期失败"
     # 即使续期失败也要重启nginx
-    docker-compose start nginx
+    ${DOCKER_SUDO} docker-compose start nginx
     exit 1
 fi
 
 # 重启nginx容器
 log "重启nginx容器..."
-if docker-compose start nginx; then
+if ${DOCKER_SUDO} docker-compose start nginx; then
     log "nginx容器重启成功"
 else
     log "错误: nginx容器重启失败"
@@ -1082,14 +1098,14 @@ fi
 
 # 验证服务状态
 sleep 5
-if docker-compose ps | grep -q "seafile-nginx.*Up"; then
+if ${DOCKER_SUDO} docker-compose ps | grep -q "seafile-nginx.*Up"; then
     log "SSL证书续期完成，服务运行正常"
 else
     log "警告: 服务状态异常，请检查"
 fi
 
 # 清理Docker资源
-docker system prune -f >/dev/null 2>&1 || true
+${DOCKER_SUDO} docker system prune -f >/dev/null 2>&1 || true
 
 log "SSL证书续期流程结束"
 EOF
@@ -1144,11 +1160,11 @@ start_services() {
     
     # 拉取最新镜像
     log_info "拉取Docker镜像..."
-    docker-compose pull
+    ${DOCKER_SUDO} docker-compose pull
     
     # 启动所有服务
     log_info "启动容器服务..."
-    docker-compose up -d
+    ${DOCKER_SUDO} docker-compose up -d
     
     log_info "⏳ 等待服务启动完成..."
     
@@ -1157,7 +1173,7 @@ start_services() {
     timeout=120
     counter=0
     while [ $counter -lt $timeout ]; do
-        if docker-compose logs seafile-mysql 2>/dev/null | grep -q "ready for connections"; then
+        if ${DOCKER_SUDO} docker-compose logs seafile-mysql 2>/dev/null | grep -q "ready for connections"; then
             log_success "✅ MySQL数据库启动完成"
             break
         fi
@@ -1170,7 +1186,7 @@ start_services() {
     
     if [ $counter -ge $timeout ]; then
         log_error "❌ MySQL启动超时"
-        docker-compose logs seafile-mysql
+        ${DOCKER_SUDO} docker-compose logs seafile-mysql
         exit 1
     fi
     
@@ -1179,13 +1195,13 @@ start_services() {
     timeout=300
     counter=0
     while [ $counter -lt $timeout ]; do
-        if docker-compose logs seafile 2>/dev/null | grep -q "Seafile started"; then
+        if ${DOCKER_SUDO} docker-compose logs seafile 2>/dev/null | grep -q "Seafile started"; then
             log_success "✅ Seafile服务启动完成"
             break
         fi
-        if docker-compose logs seafile 2>/dev/null | grep -q "Error\|Failed\|Exception"; then
+        if ${DOCKER_SUDO} docker-compose logs seafile 2>/dev/null | grep -q "Error\|Failed\|Exception"; then
             log_error "❌ Seafile启动出现错误"
-            docker-compose logs seafile
+            ${DOCKER_SUDO} docker-compose logs seafile
             exit 1
         fi
         sleep 5
@@ -1197,7 +1213,7 @@ start_services() {
     
     if [ $counter -ge $timeout ]; then
         log_error "❌ Seafile启动超时"
-        docker-compose logs seafile
+        ${DOCKER_SUDO} docker-compose logs seafile
         exit 1
     fi
     
@@ -1207,15 +1223,15 @@ start_services() {
     
     # 检查所有容器状态
     log_info "检查容器运行状态..."
-    if docker-compose ps | grep -q "Exit\|unhealthy"; then
+    if ${DOCKER_SUDO} docker-compose ps | grep -q "Exit\|unhealthy"; then
         log_warn "⚠️ 发现异常容器状态:"
-        docker-compose ps
+        ${DOCKER_SUDO} docker-compose ps
         echo
         log_info "容器日志:"
-        docker-compose logs --tail=20
+        ${DOCKER_SUDO} docker-compose logs --tail=20
     else
         log_success "✅ 所有容器运行正常"
-        docker-compose ps
+        ${DOCKER_SUDO} docker-compose ps
     fi
 }
 
@@ -1254,7 +1270,7 @@ verify_installation() {
     
     # 检查容器健康状态
     log_info "检查容器健康状态..."
-    local unhealthy_containers=$(docker-compose ps --filter "health=unhealthy" -q)
+    local unhealthy_containers=$(${DOCKER_SUDO} docker-compose ps --filter "health=unhealthy" -q)
     if [[ -z "$unhealthy_containers" ]]; then
         log_success "✅ 所有容器健康状态正常"
     else
@@ -1286,6 +1302,13 @@ set -e
 PROJECT_DIR="$HOME/seafile-docker"
 cd "$PROJECT_DIR"
 
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
+
 echo "=========================================="
 echo "🐳 Seafile Docker 状态检查"
 echo "=========================================="
@@ -1293,17 +1316,17 @@ echo
 
 # Docker容器状态
 echo "=== 📦 容器状态 ==="
-docker-compose ps
+${DOCKER_SUDO} docker-compose ps
 echo
 
 # 健康检查
 echo "=== 🏥 健康检查 ==="
 for service in seafile-mysql seafile-memcached seafile seafile-nginx; do
-    health=$(docker inspect --format='{{.State.Health.Status}}' $service 2>/dev/null || echo "no-healthcheck")
+    health=$(${DOCKER_SUDO} docker inspect --format='{{.State.Health.Status}}' $service 2>/dev/null || echo "no-healthcheck")
     if [[ "$health" == "healthy" ]]; then
         echo "✅ $service: $health"
     elif [[ "$health" == "no-healthcheck" ]]; then
-        status=$(docker inspect --format='{{.State.Status}}' $service 2>/dev/null || echo "not-found")
+        status=$(${DOCKER_SUDO} docker inspect --format='{{.State.Status}}' $service 2>/dev/null || echo "not-found")
         if [[ "$status" == "running" ]]; then
             echo "🟢 $service: $status (no healthcheck)"
         else
@@ -1376,6 +1399,13 @@ BACKUP_FILE="seafile-backup-$TIMESTAMP.tar.gz"
 
 cd "$PROJECT_DIR"
 
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
+
 echo "=========================================="
 echo "💾 Seafile 数据备份"
 echo "=========================================="
@@ -1389,7 +1419,7 @@ mkdir -p "$BACKUP_DIR"
 
 # 停止服务（可选，注释掉以实现热备份）
 # echo "停止服务..."
-# docker-compose stop
+# ${DOCKER_SUDO} docker-compose stop
 
 echo "创建备份..."
 
@@ -1408,7 +1438,7 @@ tar -czf "$BACKUP_DIR/$BACKUP_FILE" \
 
 # 重启服务（如果之前停止了）
 # echo "重启服务..."
-# docker-compose start
+# ${DOCKER_SUDO} docker-compose start
 
 # 计算备份大小
 BACKUP_SIZE=$(du -h "$BACKUP_DIR/$BACKUP_FILE" | cut -f1)
@@ -1439,6 +1469,13 @@ EOF
 PROJECT_DIR="$HOME/seafile-docker"
 cd "$PROJECT_DIR"
 
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
+
 echo "=========================================="
 echo "📋 Seafile 日志查看"
 echo "=========================================="
@@ -1447,25 +1484,25 @@ echo
 case "${1:-all}" in
     "mysql"|"db")
         echo "=== MySQL 日志 ==="
-        docker-compose logs -f seafile-mysql
+        ${DOCKER_SUDO} docker-compose logs -f seafile-mysql
         ;;
     "seafile"|"app")
         echo "=== Seafile 应用日志 ==="
-        docker-compose logs -f seafile
+        ${DOCKER_SUDO} docker-compose logs -f seafile
         ;;
     "nginx"|"web")
         echo "=== Nginx 日志 ==="
-        docker-compose logs -f nginx
+        ${DOCKER_SUDO} docker-compose logs -f nginx
         ;;
     "memcached"|"cache")
         echo "=== Memcached 日志 ==="
-        docker-compose logs -f seafile-memcached
+        ${DOCKER_SUDO} docker-compose logs -f seafile-memcached
         ;;
     "all"|*)
         echo "=== 所有服务日志 ==="
         echo "使用 Ctrl+C 停止查看"
         echo
-        docker-compose logs -f
+        ${DOCKER_SUDO} docker-compose logs -f
         ;;
 esac
 EOF
@@ -1480,6 +1517,13 @@ set -e
 PROJECT_DIR="$HOME/seafile-docker"
 cd "$PROJECT_DIR"
 
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
+
 echo "=========================================="
 echo "🔄 Seafile 更新"
 echo "=========================================="
@@ -1491,15 +1535,15 @@ echo "1. 创建更新前备份..."
 
 echo
 echo "2. 拉取最新镜像..."
-docker-compose pull
+${DOCKER_SUDO} docker-compose pull
 
 echo
 echo "3. 停止服务..."
-docker-compose down
+${DOCKER_SUDO} docker-compose down
 
 echo
 echo "4. 启动服务..."
-docker-compose up -d
+${DOCKER_SUDO} docker-compose up -d
 
 echo
 echo "5. 等待服务启动..."
@@ -1507,7 +1551,7 @@ sleep 30
 
 echo
 echo "6. 检查服务状态..."
-docker-compose ps
+${DOCKER_SUDO} docker-compose ps
 
 echo
 echo "=========================================="
@@ -1526,6 +1570,13 @@ EOF
 # Seafile卸载脚本
 
 PROJECT_DIR="$HOME/seafile-docker"
+
+# 检测是否需要sudo执行docker命令
+if ! docker ps &>/dev/null; then
+    DOCKER_SUDO="sudo"
+else
+    DOCKER_SUDO=""
+fi
 
 echo "=========================================="
 echo "🗑️  Seafile 卸载"
@@ -1549,10 +1600,10 @@ cd "$PROJECT_DIR" 2>/dev/null || {
 }
 
 echo "停止并删除容器..."
-docker-compose down -v
+${DOCKER_SUDO} docker-compose down -v
 
 echo "删除镜像..."
-docker rmi seafileltd/seafile-mc:11.0-latest mysql:8.0 memcached:1.6-alpine nginx:alpine 2>/dev/null || true
+${DOCKER_SUDO} docker rmi seafileltd/seafile-mc:11.0-latest mysql:8.0 memcached:1.6-alpine nginx:alpine 2>/dev/null || true
 
 if [[ "$delete_data" == "yes" ]]; then
     echo "删除项目目录..."
