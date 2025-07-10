@@ -5,7 +5,7 @@
 # GitHub: https://github.com/wzwys9/my_abc
 # 版本: 1.1
 # 更新日期: 2025-07-11
-echo -e "1.8"
+
 set -e
 
 # 颜色定义
@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 全局变量
-SCRIPT_VERSION="1.11"
+SCRIPT_VERSION="1.12"
 PROJECT_DIR=""
 DOMAIN=""
 EMAIL=""
@@ -74,6 +74,103 @@ show_banner() {
     echo "预计用时: 15-25分钟"
     echo "=================================================="
     echo
+}
+
+# 全局清理函数
+global_cleanup() {
+    log_info "🧹 执行全局环境清理..."
+    
+    # 清理所有可能的临时容器（不管是否有sudo权限）
+    for cmd in "docker" "sudo docker"; do
+        $cmd stop temp-nginx seafile-temp nginx-temp 2>/dev/null || true
+        $cmd rm temp-nginx seafile-temp nginx-temp 2>/dev/null || true
+    done
+    
+    # 清理临时文件
+    rm -f temp-nginx.conf nginx-temp.conf 2>/dev/null || true
+    rm -f seafile-*.sh install-*.sh 2>/dev/null || true
+    rm -f acme-*.log certbot-*.log 2>/dev/null || true
+    
+    # 清理可能占用端口的进程
+    sudo pkill -f "nginx.*temp" 2>/dev/null || true
+    sudo pkill -f "certbot.*standalone" 2>/dev/null || true
+    sudo pkill -f "acme\.sh.*daemon" 2>/dev/null || true
+    
+    # 清理可能的Docker网络冲突
+    for cmd in "docker" "sudo docker"; do
+        $cmd network prune -f 2>/dev/null || true
+        $cmd system prune -f 2>/dev/null || true
+    done
+    
+    # 清理可能的SSL工具冲突
+    sudo pkill -f "python.*certbot" 2>/dev/null || true
+    sudo pkill -f "acme.*challenge" 2>/dev/null || true
+    
+    log_success "✅ 全局环境清理完成"
+}
+
+# 系统预检查和清理
+pre_check_and_cleanup() {
+    log_step "🔍 系统预检查和环境清理..."
+    
+    # 执行全局清理
+    global_cleanup
+    
+    # 检查并清理端口占用
+    if netstat -tlpn 2>/dev/null | grep ":80 " >/dev/null 2>&1; then
+        log_warn "⚠️ 检测到80端口被占用，正在清理..."
+        PORT_PIDS=$(sudo netstat -tlpn | grep ":80 " | awk '{print $7}' | cut -d'/' -f1 | grep -v "^-$" | sort -u)
+        for pid in $PORT_PIDS; do
+            if [[ -n "$pid" && "$pid" != "-" ]]; then
+                PROCESS_NAME=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+                log_info "终止占用80端口的进程: $pid ($PROCESS_NAME)"
+                sudo kill -TERM "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 3
+        
+        # 如果还有占用，强制终止
+        if netstat -tlpn 2>/dev/null | grep ":80 " >/dev/null 2>&1; then
+            PORT_PIDS=$(sudo netstat -tlpn | grep ":80 " | awk '{print $7}' | cut -d'/' -f1 | grep -v "^-$" | sort -u)
+            for pid in $PORT_PIDS; do
+                if [[ -n "$pid" && "$pid" != "-" ]]; then
+                    log_warn "强制终止进程: $pid"
+                    sudo kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+    
+    # 检查443端口
+    if netstat -tlpn 2>/dev/null | grep ":443 " >/dev/null 2>&1; then
+        log_warn "⚠️ 检测到443端口被占用，正在清理..."
+        PORT_PIDS=$(sudo netstat -tlpn | grep ":443 " | awk '{print $7}' | cut -d'/' -f1 | grep -v "^-$" | sort -u)
+        for pid in $PORT_PIDS; do
+            if [[ -n "$pid" && "$pid" != "-" ]]; then
+                PROCESS_NAME=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+                log_info "终止占用443端口的进程: $pid ($PROCESS_NAME)"
+                sudo kill -TERM "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+    
+    # 清理可能的SSL证书获取残留
+    if [[ -d "/var/lib/letsencrypt" ]]; then
+        sudo rm -rf /var/lib/letsencrypt/.certbot.lock 2>/dev/null || true
+    fi
+    
+    # 清理acme.sh可能的锁文件
+    rm -f "$HOME/.acme.sh/*.lock" 2>/dev/null || true
+    
+    # 停止可能冲突的系统服务
+    for service in nginx apache2 httpd lighttpd; do
+        if systemctl is-active --quiet $service 2>/dev/null; then
+            log_info "停止系统服务: $service"
+            sudo systemctl stop $service 2>/dev/null || true
+        fi
+    done
+    
+    log_success "✅ 系统预检查和清理完成"
 }
 
 # 检查是否为root用户
@@ -1042,7 +1139,7 @@ create_renewal_script() {
     # 创建续期脚本
     cat > renew-cert.sh << 'EOF'
 #!/bin/bash
-# SSL证书自动续期脚本
+# SSL证书自动续期脚本（支持acme.sh）
 # 由Seafile Docker安装脚本自动生成
 
 set -e
@@ -1062,6 +1159,15 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
 
+# 清理函数
+cleanup() {
+    ${DOCKER_SUDO} docker start nginx 2>/dev/null || true
+    sudo pkill -f "acme.sh" 2>/dev/null || true
+}
+
+# 设置清理陷阱
+trap cleanup EXIT
+
 log "开始SSL证书续期检查..."
 
 # 进入项目目录
@@ -1070,20 +1176,65 @@ cd "$PROJECT_DIR" || {
     exit 1
 }
 
-# 停止nginx容器以释放80端口
-log "停止nginx容器..."
-if ! ${DOCKER_SUDO} docker-compose stop nginx; then
-    log "警告: 停止nginx容器失败"
+# 获取域名
+DOMAIN=$(grep "server_name" nginx.conf | head -1 | awk '{print $2}' | sed 's/;//')
+if [[ -z "$DOMAIN" ]]; then
+    log "错误: 无法从nginx配置中获取域名"
+    exit 1
 fi
 
-# 续期证书
-log "执行证书续期..."
-if sudo certbot renew --quiet --deploy-hook "systemctl reload nginx 2>/dev/null || true"; then
-    log "证书续期检查完成"
+# 检查是否使用acme.sh
+if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+    log "使用acme.sh续期证书..."
+    
+    # 加载acme.sh环境
+    source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
+    
+    # 停止nginx容器以释放80端口
+    log "停止nginx容器..."
+    if ! ${DOCKER_SUDO} docker-compose stop nginx; then
+        log "警告: 停止nginx容器失败"
+    fi
+    
+    # 使用acme.sh续期
+    log "执行acme.sh证书续期..."
+    if "$HOME/.acme.sh/acme.sh" --renew -d "$DOMAIN" --force; then
+        log "acme.sh证书续期成功"
+        
+        # 重新安装证书
+        "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" \
+            --cert-file "/etc/letsencrypt/live/$DOMAIN/cert.pem" \
+            --key-file "/etc/letsencrypt/live/$DOMAIN/privkey.pem" \
+            --fullchain-file "/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        
+        log "证书重新安装完成"
+    else
+        log "错误: acme.sh证书续期失败"
+        cleanup
+        exit 1
+    fi
+    
+elif command -v certbot &>/dev/null; then
+    log "使用certbot续期证书..."
+    
+    # 停止nginx容器以释放80端口
+    log "停止nginx容器..."
+    if ! ${DOCKER_SUDO} docker-compose stop nginx; then
+        log "警告: 停止nginx容器失败"
+    fi
+    
+    # 使用certbot续期
+    log "执行certbot证书续期..."
+    if sudo certbot renew --quiet; then
+        log "certbot证书续期检查完成"
+    else
+        log "错误: certbot证书续期失败"
+        cleanup
+        exit 1
+    fi
 else
-    log "错误: 证书续期失败"
-    # 即使续期失败也要重启nginx
-    ${DOCKER_SUDO} docker-compose start nginx
+    log "错误: 未找到acme.sh或certbot"
+    cleanup
     exit 1
 fi
 
@@ -1104,6 +1255,13 @@ else
     log "警告: 服务状态异常，请检查"
 fi
 
+# 验证证书有效期
+if [[ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ]]; then
+    CERT_EXPIRY=$(sudo openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" -noout -enddate | cut -d= -f2)
+    DAYS_LEFT=$(( ($(date -d "$CERT_EXPIRY" +%s) - $(date +%s)) / 86400 ))
+    log "证书有效期至: $CERT_EXPIRY (剩余 $DAYS_LEFT 天)"
+fi
+
 # 清理Docker资源
 ${DOCKER_SUDO} docker system prune -f >/dev/null 2>&1 || true
 
@@ -1117,8 +1275,49 @@ EOF
 #!/bin/bash
 # SSL证书续期测试脚本
 
-echo "测试SSL证书续期功能..."
-sudo certbot renew --dry-run
+echo "🔍 测试SSL证书续期功能..."
+echo
+
+# 检查使用的SSL工具
+if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
+    echo "使用acme.sh进行测试..."
+    
+    # 加载acme.sh环境
+    source "$HOME/.acme.sh/acme.sh.env" 2>/dev/null || true
+    
+    # 获取域名
+    DOMAIN=$(grep "server_name" nginx.conf | head -1 | awk '{print $2}' | sed 's/;//' 2>/dev/null)
+    
+    if [[ -n "$DOMAIN" ]]; then
+        echo "域名: $DOMAIN"
+        echo
+        echo "📋 当前证书信息:"
+        "$HOME/.acme.sh/acme.sh" --list | grep "$DOMAIN" || echo "未找到证书记录"
+        
+        echo
+        echo "🧪 测试续期功能..."
+        "$HOME/.acme.sh/acme.sh" --renew -d "$DOMAIN" --dry-run --force
+        
+        echo
+        echo "📅 证书有效期:"
+        if [[ -f "/etc/letsencrypt/live/$DOMAIN/cert.pem" ]]; then
+            openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/cert.pem" -noout -enddate
+        else
+            echo "证书文件未找到"
+        fi
+    else
+        echo "❌ 无法获取域名信息"
+    fi
+    
+elif command -v certbot &>/dev/null; then
+    echo "使用certbot进行测试..."
+    sudo certbot renew --dry-run
+else
+    echo "❌ 未找到acme.sh或certbot"
+    exit 1
+fi
+
+echo
 echo "如果上述命令没有错误，说明自动续期配置正确"
 EOF
 
@@ -1760,9 +1959,11 @@ show_completion_info() {
     echo
     
     echo -e "${CYAN}🔐 SSL证书${NC}"
-    echo "🔒 自动续期已配置 (每周一 03:00)"
+    echo "🔒 使用acme.sh管理SSL证书（更稳定可靠）"
+    echo "🔄 自动续期已配置 (每周一 03:00)"
     echo "📅 续期日志: /var/log/seafile-cert-renewal.log"
     echo "🧪 测试续期: cd $PROJECT_DIR && ./test-renewal.sh"
+    echo "📋 查看证书: ~/.acme.sh/acme.sh --list"
     echo
     
     echo -e "${CYAN}💡 使用提示${NC}"
@@ -1823,6 +2024,31 @@ handle_error() {
     log_error "❌ 脚本执行失败 (退出码: $exit_code)"
     log_error "错误发生在第 $1 行"
     
+    # 自动清理函数
+    cleanup_on_error() {
+        log_info "🧹 执行错误清理..."
+        
+        # 停止和清理Docker容器
+        ${DOCKER_SUDO} docker stop temp-nginx 2>/dev/null || true
+        ${DOCKER_SUDO} docker rm temp-nginx 2>/dev/null || true
+        
+        # 清理临时文件
+        rm -f temp-nginx.conf 2>/dev/null || true
+        rm -f seafile-docker-install.sh 2>/dev/null || true
+        
+        # 清理可能的进程
+        sudo pkill -f "certbot" 2>/dev/null || true
+        sudo pkill -f "acme.sh" 2>/dev/null || true
+        sudo pkill -f "nginx.*temp" 2>/dev/null || true
+        
+        # 清理Docker资源
+        ${DOCKER_SUDO} docker system prune -f 2>/dev/null || true
+        
+        log_info "✅ 错误清理完成"
+    }
+    
+    cleanup_on_error
+    
     echo
     echo "🔧 故障排除建议:"
     echo "1. 检查错误信息并根据提示解决"
@@ -1831,6 +2057,7 @@ handle_error() {
     echo "4. 对于Debian系统，确保使用正确的软件源"
     echo "5. 查看详细日志: $PROJECT_DIR/logs.sh"
     echo "6. 如需帮助，请保存上述错误信息"
+    echo "7. 可以重新运行脚本，已加入自动清理功能"
     
     exit $exit_code
 }
@@ -1842,6 +2069,9 @@ main() {
     
     # 显示横幅
     show_banner
+    
+    # 系统预检查和清理
+    pre_check_and_cleanup
     
     # 确认继续
     read -p "按回车键开始安装，或按 Ctrl+C 取消: "
@@ -1873,8 +2103,14 @@ Seafile Docker 安装信息
 脚本版本: $SCRIPT_VERSION
 系统信息: $OS_ID $OS_VERSION_ID ($OS_CODENAME)
 Docker版本: $(docker --version)
+SSL工具: acme.sh (推荐)
 =========================================
 EOF
+    
+    # 最终清理
+    log_step "🧹 执行最终清理..."
+    global_cleanup
+    log_success "✅ 最终清理完成"
     
     log_success "🎉 安装完成！感谢使用 Seafile Docker 安装脚本！"
 }
