@@ -99,12 +99,12 @@ check_system() {
     
     if [[ "$OS_NAME" != "Ubuntu" ]]; then
         log_error "❌ 此脚本仅支持Ubuntu系统，当前系统: $OS_NAME"
-        exit 1
+        
     fi
     
     if [[ ! "$OS_VERSION" =~ ^(20\.04|22\.04) ]]; then
         log_error "❌ 此脚本仅支持Ubuntu 20.04/22.04 LTS，当前版本: $OS_VERSION"
-        exit 1
+        
     fi
     
     # 检查内存
