@@ -3,7 +3,7 @@
 # Seafile Docker 自动安装脚本
 # 适用于 Debian/Ubuntu 系列发行版
 # GitHub: https://github.com/wzwys9/my_abc
-# 版本: 1.1
+# 版本: 1.2 (包含SSL选择菜单)
 # 更新日期: 2025-07-11
 
 set -e
@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 全局变量
-SCRIPT_VERSION="1.13"
+SCRIPT_VERSION="1.2"
 PROJECT_DIR=""
 DOMAIN=""
 EMAIL=""
