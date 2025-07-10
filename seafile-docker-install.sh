@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Seafile Docker 自动安装脚本
-# 适用于 Ubuntu 20.04/22.04 LTS
-# GitHub: https://github.com/your-username/seafile-docker-installer
-# 版本: 1.0
+# 适用于 Debian/Ubuntu 系列发行版
+# GitHub: https://github.com/wzwys9/my_abc
+# 版本: 1.1
 # 更新日期: 2025-07-11
 
 set -e
@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # 全局变量
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 PROJECT_DIR=""
 DOMAIN=""
 EMAIL=""
@@ -26,6 +26,9 @@ MYSQL_ROOT_PASSWORD=""
 MYSQL_SEAFILE_PASSWORD=""
 SEAFILE_ADMIN_EMAIL=""
 SEAFILE_ADMIN_PASSWORD=""
+OS_ID=""
+OS_VERSION_ID=""
+OS_CODENAME=""
 
 # 日志函数
 log_info() {
@@ -66,7 +69,7 @@ show_banner() {
     echo "  🔒 Nginx反向代理 + SSL证书"
     echo "  ⚙️  自动化管理脚本"
     echo
-    echo "支持系统: Ubuntu 20.04/22.04 LTS"
+    echo "支持系统: Debian 11+, Ubuntu 20.04+"
     echo "预计用时: 15-25分钟"
     echo "=================================================="
     echo
@@ -85,32 +88,84 @@ check_root() {
     fi
 }
 
+# 检测操作系统信息
+detect_os() {
+    # 安装lsb-release如果不存在
+    if ! command -v lsb_release &> /dev/null; then
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y lsb-release
+        else
+            log_error "无法安装lsb-release，请手动安装"
+            exit 1
+        fi
+    fi
+
+    # 读取系统信息
+    OS_ID=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
+    OS_VERSION_ID=$(lsb_release -sr)
+    OS_CODENAME=$(lsb_release -sc)
+    
+    # 输出调试信息
+    log_debug "检测到的系统信息："
+    log_debug "OS_ID: $OS_ID"
+    log_debug "OS_VERSION_ID: $OS_VERSION_ID"  
+    log_debug "OS_CODENAME: $OS_CODENAME"
+}
+
 # 检查系统版本
 check_system() {
     log_step "🔍 检查系统环境..."
     
-    # 检查操作系统
-    if ! command -v lsb_release &> /dev/null; then
-        sudo apt update && sudo apt install -y lsb-release
-    fi
+    detect_os
     
-    OS_NAME=$(lsb_release -si)
-    OS_VERSION=$(lsb_release -sr)
-    
-    if [[ "$OS_NAME" != "Ubuntu" ]]; then
-        log_error "❌ 此脚本仅支持Ubuntu系统，当前系统: $OS_NAME"
-        
-    fi
-    
-    if [[ ! "$OS_VERSION" =~ ^(20\.04|22\.04) ]]; then
-        log_error "❌ 此脚本仅支持Ubuntu 20.04/22.04 LTS，当前版本: $OS_VERSION"
-        
-    fi
+    # 检查是否为Debian系列
+    case "$OS_ID" in
+        "ubuntu")
+            if [[ ! "$OS_VERSION_ID" =~ ^(18\.04|20\.04|22\.04|24\.04) ]]; then
+                log_warn "⚠️ Ubuntu版本 $OS_VERSION_ID 未经测试，建议使用 20.04/22.04 LTS"
+                read -p "是否继续安装? (y/N): " continue_install
+                if [[ ! $continue_install =~ ^[Yy]$ ]]; then
+                    exit 0
+                fi
+            fi
+            ;;
+        "debian")
+            # 检查Debian版本
+            case "$OS_VERSION_ID" in
+                "11"|"12")
+                    log_info "✅ 支持的Debian版本: $OS_VERSION_ID ($OS_CODENAME)"
+                    ;;
+                *)
+                    log_warn "⚠️ Debian版本 $OS_VERSION_ID 未经测试，建议使用 11 (bullseye) 或 12 (bookworm)"
+                    read -p "是否继续安装? (y/N): " continue_install
+                    if [[ ! $continue_install =~ ^[Yy]$ ]]; then
+                        exit 0
+                    fi
+                    ;;
+            esac
+            ;;
+        "linuxmint"|"pop"|"elementary"|"zorin")
+            log_info "✅ 检测到基于Ubuntu的发行版: $OS_ID"
+            # 对于基于Ubuntu的发行版，使用Ubuntu的包管理方式
+            OS_ID="ubuntu"
+            ;;
+        "kali"|"parrot")
+            log_info "✅ 检测到基于Debian的发行版: $OS_ID"
+            # 对于基于Debian的发行版，使用Debian的包管理方式
+            OS_ID="debian"
+            ;;
+        *)
+            log_error "❌ 不支持的操作系统: $OS_ID"
+            log_error "此脚本仅支持 Debian/Ubuntu 系列发行版"
+            exit 1
+            ;;
+    esac
     
     # 检查内存
     TOTAL_MEM=$(free -m | awk 'NR==2{printf "%.0f", $2}')
     if [[ $TOTAL_MEM -lt 1500 ]]; then
-        log_warn "⚠️ 系统内存不足2GB，可能影响Seafile性能"
+        log_warn "⚠️ 系统内存不足2GB ($TOTAL_MEM MB)，可能影响Seafile性能"
         read -p "是否继续安装? (y/N): " continue_install
         if [[ ! $continue_install =~ ^[Yy]$ ]]; then
             log_info "安装已取消"
@@ -124,7 +179,7 @@ check_system() {
         log_warn "⚠️ 磁盘可用空间不足5GB，建议清理磁盘空间"
     fi
     
-    log_success "✅ 系统环境检查通过: $OS_NAME $OS_VERSION"
+    log_success "✅ 系统环境检查通过: $OS_ID $OS_VERSION_ID ($OS_CODENAME)"
     log_info "📊 系统信息: 内存 ${TOTAL_MEM}MB, 可用空间 $((AVAILABLE_SPACE/1024/1024))GB"
 }
 
@@ -154,21 +209,58 @@ validate_email() {
     fi
 }
 
+# 获取服务器公网IP
+get_server_ip() {
+    local ip=""
+    
+    # 尝试多个IP检测服务
+    local ip_services=(
+        "http://ifconfig.me/ip"
+        "http://ipinfo.io/ip"
+        "http://ip.sb"
+        "http://myip.ipip.net"
+        "http://checkip.amazonaws.com"
+    )
+    
+    for service in "${ip_services[@]}"; do
+        ip=$(curl -s --connect-timeout 10 --max-time 15 "$service" 2>/dev/null | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
+        if [[ -n "$ip" && "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    
+    # 如果所有服务都失败，尝试从网络接口获取
+    ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+    if [[ -n "$ip" && "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "$ip"
+        return 0
+    fi
+    
+    return 1
+}
+
 # 检查域名解析
 check_domain_resolution() {
     local domain=$1
     log_step "🌐 检查域名解析..."
     
     # 获取服务器公网IP
-    SERVER_IP=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || curl -s icanhazip.com)
+    SERVER_IP=$(get_server_ip)
     
     if [[ -z "$SERVER_IP" ]]; then
         log_warn "⚠️ 无法获取服务器公网IP，跳过域名解析检查"
+        log_info "请确保域名已正确解析到此服务器"
         return 0
     fi
     
     # 检查域名解析
-    RESOLVED_IP=$(dig +short $domain | tail -n1)
+    RESOLVED_IP=$(dig +short $domain 2>/dev/null | tail -n1)
+    
+    if [[ -z "$RESOLVED_IP" ]]; then
+        # 尝试使用nslookup
+        RESOLVED_IP=$(nslookup $domain 2>/dev/null | awk '/^Address: / { print $2 }' | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' | head -1)
+    fi
     
     if [[ "$RESOLVED_IP" == "$SERVER_IP" ]]; then
         log_success "✅ 域名解析正确: $domain -> $SERVER_IP"
@@ -295,6 +387,7 @@ get_user_input() {
     echo "  👤 管理员邮箱: $SEAFILE_ADMIN_EMAIL"
     echo "  🗃️  数据库: MySQL 8.0"
     echo "  🐳 容器化: Docker Compose"
+    echo "  🖥️  系统: $OS_ID $OS_VERSION_ID"
     echo
     
     read -p "✅ 确认以上信息正确吗? (y/N): " confirm
@@ -311,10 +404,10 @@ install_dependencies() {
     log_step "📦 安装系统依赖包..."
     
     # 更新软件包列表
-    sudo apt update
+    sudo apt-get update
     
     # 安装基础工具
-    sudo apt install -y \
+    sudo apt-get install -y \
         apt-transport-https \
         ca-certificates \
         curl \
@@ -325,7 +418,8 @@ install_dependencies() {
         unzip \
         tar \
         openssl \
-        dnsutils
+        dnsutils \
+        net-tools
     
     log_success "✅ 系统依赖安装完成"
 }
@@ -342,17 +436,29 @@ install_docker() {
         log_info "正在安装Docker..."
         
         # 删除旧版本
-        sudo apt remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+        sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
         
-        # 添加Docker官方GPG密钥
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-        
-        # 添加Docker仓库
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        # 根据系统类型配置Docker仓库
+        case "$OS_ID" in
+            "ubuntu")
+                # Ubuntu系统配置
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                ;;
+            "debian")
+                # Debian系统配置
+                curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                ;;
+            *)
+                log_error "不支持的操作系统: $OS_ID"
+                exit 1
+                ;;
+        esac
         
         # 安装Docker
-        sudo apt update
-        sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        sudo apt-get update
+        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
         
         # 启动Docker服务
         sudo systemctl start docker
@@ -742,6 +848,11 @@ EOF
 # Seafile Docker 环境变量配置
 # 生成时间: $(date)
 
+# 系统信息
+OS_ID=${OS_ID}
+OS_VERSION=${OS_VERSION_ID}
+OS_CODENAME=${OS_CODENAME}
+
 # 域名配置
 DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
@@ -773,8 +884,25 @@ setup_ssl() {
     # 安装certbot
     if ! command -v certbot &> /dev/null; then
         log_info "安装Certbot..."
-        sudo apt update
-        sudo apt install -y certbot
+        sudo apt-get update
+        
+        # 根据系统类型安装certbot
+        case "$OS_ID" in
+            "ubuntu")
+                sudo apt-get install -y certbot
+                ;;
+            "debian")
+                # Debian系统可能需要从backports安装更新的certbot
+                if [[ "$OS_VERSION_ID" == "11" ]]; then
+                    sudo apt-get install -y certbot
+                else
+                    sudo apt-get install -y certbot
+                fi
+                ;;
+            *)
+                sudo apt-get install -y certbot
+                ;;
+        esac
     fi
     
     # 创建证书目录
@@ -786,7 +914,7 @@ setup_ssl() {
     sudo pkill -f "nginx" 2>/dev/null || true
     
     # 检查80端口是否被占用
-    if netstat -tlpn | grep ":80 " >/dev/null 2>&1; then
+    if netstat -tlpn 2>/dev/null | grep ":80 " >/dev/null 2>&1; then
         log_error "端口80被占用，请先停止占用该端口的服务"
         netstat -tlpn | grep ":80 "
         exit 1
@@ -1165,13 +1293,13 @@ echo
 # 系统资源
 echo "=== 💻 系统资源 ==="
 echo "CPU使用率:"
-top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//'
+top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/%us,//' || echo "无法获取"
 
 echo "内存使用:"
 free -h | awk 'NR==2{printf "使用: %s/%s (%.1f%%)\n", $3,$2,$3*100/$2}'
 
 echo "磁盘使用:"
-df -h "$PROJECT_DIR" | awk 'NR==2{printf "使用: %s/%s (%.1f%%)\n", $3,$2,$5}' | sed 's/%//'
+df -h "$PROJECT_DIR" | awk 'NR==2{printf "使用: %s/%s (%s)\n", $3,$2,$5}'
 
 echo
 
@@ -1405,8 +1533,11 @@ if [[ "$delete_data" == "yes" ]]; then
     echo "删除项目目录..."
     cd "$HOME"
     rm -rf "$PROJECT_DIR"
-    echo "删除SSL证书..."
-    sudo rm -rf /etc/letsencrypt/live/$(grep server_name "$PROJECT_DIR/nginx.conf" | head -1 | awk '{print $2}' | sed 's/;//') 2>/dev/null || true
+    DOMAIN=$(grep server_name "$PROJECT_DIR/nginx.conf" 2>/dev/null | head -1 | awk '{print $2}' | sed 's/;//' || echo "")
+    if [[ -n "$DOMAIN" ]]; then
+        echo "删除SSL证书..."
+        sudo rm -rf "/etc/letsencrypt/live/$DOMAIN" 2>/dev/null || true
+    fi
 fi
 
 echo "删除定时任务..."
@@ -1422,14 +1553,14 @@ EOF
     chmod +x status.sh backup.sh logs.sh update.sh uninstall.sh
 
     # 创建README文件
-    cat > README.md << 'EOF'
+    cat > README.md << EOF
 # Seafile Docker 安装
 
-这是一个自动生成的Seafile Docker项目。
+这是一个自动生成的Seafile Docker项目，运行在 ${OS_ID} ${OS_VERSION_ID} 系统上。
 
 ## 🚀 快速开始
 
-```bash
+\`\`\`bash
 # 查看状态
 ./status.sh
 
@@ -1444,21 +1575,21 @@ docker-compose down
 
 # 启动服务  
 docker-compose up -d
-```
+\`\`\`
 
 ## 📊 管理脚本
 
-- `status.sh` - 检查系统状态
-- `backup.sh` - 备份数据
-- `logs.sh [service]` - 查看日志
-- `update.sh` - 更新Seafile
-- `uninstall.sh` - 卸载Seafile
-- `renew-cert.sh` - 续期SSL证书
-- `test-renewal.sh` - 测试证书续期
+- \`status.sh\` - 检查系统状态
+- \`backup.sh\` - 备份数据
+- \`logs.sh [service]\` - 查看日志
+- \`update.sh\` - 更新Seafile
+- \`uninstall.sh\` - 卸载Seafile
+- \`renew-cert.sh\` - 续期SSL证书
+- \`test-renewal.sh\` - 测试证书续期
 
 ## 📁 目录结构
 
-```
+\`\`\`
 seafile-docker/
 ├── docker-compose.yml  # Docker编排文件
 ├── nginx.conf          # Nginx配置
@@ -1468,11 +1599,11 @@ seafile-docker/
 │   └── mysql-data/    # 数据库数据
 ├── logs/              # 日志目录
 └── *.sh               # 管理脚本
-```
+\`\`\`
 
 ## 🔧 常用命令
 
-```bash
+\`\`\`bash
 # 查看容器状态
 docker-compose ps
 
@@ -1488,20 +1619,26 @@ docker-compose up -d --force-recreate
 
 # 清理无用资源
 docker system prune -f
-```
+\`\`\`
 
 ## 🆘 故障排除
 
-1. **容器启动失败**: 检查 `docker-compose logs`
+1. **容器启动失败**: 检查 \`docker-compose logs\`
 2. **无法访问网站**: 检查域名解析和防火墙
-3. **SSL证书问题**: 运行 `sudo certbot certificates`
-4. **数据库连接错误**: 检查 `.env` 文件中的密码
+3. **SSL证书问题**: 运行 \`sudo certbot certificates\`
+4. **数据库连接错误**: 检查 \`.env\` 文件中的密码
 
 ## 📞 获取帮助
 
-- 查看日志: `./logs.sh`
-- 检查状态: `./status.sh`
+- 查看日志: \`./logs.sh\`
+- 检查状态: \`./status.sh\`
 - 官方文档: https://manual.seafile.com/
+
+## 系统信息
+
+- 操作系统: ${OS_ID} ${OS_VERSION_ID} (${OS_CODENAME})
+- 安装时间: $(date)
+- 脚本版本: ${SCRIPT_VERSION}
 EOF
 
     log_success "✅ 管理脚本创建完成"
@@ -1534,6 +1671,7 @@ show_completion_info() {
     echo "🐳 容器数量: 4个 (MySQL + Memcached + Seafile + Nginx)"
     echo "💾 数据目录: $PROJECT_DIR/data"
     echo "📝 日志目录: $PROJECT_DIR/logs"
+    echo "🖥️  运行系统: $OS_ID $OS_VERSION_ID ($OS_CODENAME)"
     echo
     
     echo -e "${CYAN}⚙️ 管理命令${NC}"
@@ -1614,8 +1752,9 @@ handle_error() {
     echo "1. 检查错误信息并根据提示解决"
     echo "2. 确保域名已正确解析到服务器"
     echo "3. 检查网络连接和防火墙设置"
-    echo "4. 查看详细日志: $PROJECT_DIR/logs.sh"
-    echo "5. 如需帮助，请保存上述错误信息"
+    echo "4. 对于Debian系统，确保使用正确的软件源"
+    echo "5. 查看详细日志: $PROJECT_DIR/logs.sh"
+    echo "6. 如需帮助，请保存上述错误信息"
     
     exit $exit_code
 }
@@ -1656,7 +1795,7 @@ Seafile Docker 安装信息
 管理员邮箱: $SEAFILE_ADMIN_EMAIL
 项目目录: $PROJECT_DIR
 脚本版本: $SCRIPT_VERSION
-系统信息: $(lsb_release -d | cut -d: -f2 | xargs)
+系统信息: $OS_ID $OS_VERSION_ID ($OS_CODENAME)
 Docker版本: $(docker --version)
 =========================================
 EOF
