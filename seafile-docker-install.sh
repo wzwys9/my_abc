@@ -5,7 +5,7 @@
 # GitHub: https://github.com/wzwys9/my_abc
 # 版本: 1.1
 # 更新日期: 2025-07-11
-
+echo -e "1.8"
 set -e
 
 # 颜色定义
