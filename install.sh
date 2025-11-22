@@ -484,12 +484,13 @@ EOL
       "xver": 0,
       "serverNames": ["${domain}"],
       "privateKey": "${private_key}",
-      "shortIds": ["${shortid}"]
+      "shortIds": ["", "${shortid}"]
     }
   },
   "sniffing": {
-    "enabled": false,
-    "destOverride": ["http", "tls", "quic"]
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"],
+    "routeOnly": true
   },
   "tag": "inbound-${port}"
 }
