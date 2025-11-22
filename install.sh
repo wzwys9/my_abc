@@ -1010,7 +1010,7 @@ add_port_configuration() {
     
     # 生成密钥
     private_key=$(echo -n ${uuid} | md5sum | head -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-    tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i)
+    tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
     default_private_key=$(echo ${tmp_key} | awk '{print $3}')
     default_public_key=$(echo ${tmp_key} | awk '{print $6}')
     
@@ -1020,7 +1020,7 @@ add_port_configuration() {
         private_key=$default_private_key
         public_key=$default_public_key
     else
-        tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i)
+        tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
         private_key=$(echo ${tmp_key} | awk '{print $3}')
         public_key=$(echo ${tmp_key} | awk '{print $6}')
     fi
@@ -1785,7 +1785,7 @@ modify_port_uuid() {
         
         # 生成新的密钥
         local seed=$(echo -n ${new_uuid} | md5sum | head -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-        local tmp_key=$(echo -n ${seed} | xargs xray x25519 -i)
+        local tmp_key=$(xray x25519 -i "${seed}" 2>/dev/null)
         local new_private_key=$(echo ${tmp_key} | awk '{print $3}')
         local new_public_key=$(echo ${tmp_key} | awk '{print $6}')
 
@@ -2824,7 +2824,7 @@ generate_haproxy_config_direct() {
                 local private_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.privateKey')
                 
                 # 生成公钥（尝试使用xray命令）
-                local tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i 2>/dev/null || echo "Failed")
+                local tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null || echo "Failed")
                 local public_key
                 if [[ "$tmp_key" == "Failed" ]]; then
                     public_key="auto_generated_public_key"
