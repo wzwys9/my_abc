@@ -12,7 +12,7 @@ cyan='\e[96m'
 none='\e[0m'
 
 # 脚本版本
-VERSION="2.0.12"
+VERSION="2.1.0-fixed"
 
 # 配置文件路径
 CONFIG_FILE="/usr/local/etc/xray/config.json"
@@ -484,12 +484,13 @@ EOL
       "xver": 0,
       "serverNames": ["${domain}"],
       "privateKey": "${private_key}",
-      "shortIds": ["${shortid}"]
+      "shortIds": ["", "${shortid}"]
     }
   },
   "sniffing": {
-    "enabled": false,
-    "destOverride": ["http", "tls", "quic"]
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"],
+    "routeOnly": true
   },
   "tag": "inbound-${port}"
 }
@@ -1009,9 +1010,9 @@ add_port_configuration() {
     
     # 生成密钥
     private_key=$(echo -n ${uuid} | md5sum | head -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-    tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i)
-    default_private_key=$(echo ${tmp_key} | awk '{print $3}')
-    default_public_key=$(echo ${tmp_key} | awk '{print $6}')
+    tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
+    default_private_key=$(echo "$tmp_key" | awk 'NR==1{print $2}')
+    default_public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
     
     echo -e "请输入 "$yellow"x25519 Private Key"$none" x25519私钥 :"
     read -p "$(echo -e "(默认私钥 Private Key: ${cyan}${default_private_key}${none}): ")" private_key
@@ -1019,9 +1020,9 @@ add_port_configuration() {
         private_key=$default_private_key
         public_key=$default_public_key
     else
-        tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i)
-        private_key=$(echo ${tmp_key} | awk '{print $3}')
-        public_key=$(echo ${tmp_key} | awk '{print $6}')
+        tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
+        private_key=$(echo "$tmp_key" | awk 'NR==1{print $2}')
+        public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
     fi
     
     echo
@@ -1784,9 +1785,9 @@ modify_port_uuid() {
         
         # 生成新的密钥
         local seed=$(echo -n ${new_uuid} | md5sum | head -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-        local tmp_key=$(echo -n ${seed} | xargs xray x25519 -i)
-        local new_private_key=$(echo ${tmp_key} | awk '{print $3}')
-        local new_public_key=$(echo ${tmp_key} | awk '{print $6}')
+        local tmp_key=$(xray x25519 -i "${seed}" 2>/dev/null)
+        local new_private_key=$(echo "$tmp_key" | awk 'NR==1{print $2}')
+        local new_public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
 
         # 获取旧密钥对
         local old_private_key=$(echo "$port_info" | jq -r '.private_key')
@@ -2823,12 +2824,12 @@ generate_haproxy_config_direct() {
                 local private_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.privateKey')
                 
                 # 生成公钥（尝试使用xray命令）
-                local tmp_key=$(echo -n ${private_key} | xargs xray x25519 -i 2>/dev/null || echo "Failed")
+                local tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null || echo "Failed")
                 local public_key
                 if [[ "$tmp_key" == "Failed" ]]; then
                     public_key="auto_generated_public_key"
                 else
-                    public_key=$(echo ${tmp_key} | awk '{print $6}')
+                    public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
                 fi
                 
                 local shortid=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.shortIds[0]')
