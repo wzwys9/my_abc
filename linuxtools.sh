@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================
-# 终端工具一键安装脚本
+# 终端工具一键安装脚本1.2
 # 包含: zoxide, fzf, bat, eza, fd, ripgrep, btop, ncdu, tmux
 # ============================================
 
@@ -165,6 +165,27 @@ sudo chmod +x "$GLOBAL_SCRIPT"
 print_success "全局配置脚本已创建: $GLOBAL_SCRIPT"
 
 # ============================================
+# 3.5. 配置全局 bashrc（非登录 shell 也生效）
+# ============================================
+print_status "配置全局 bashrc（确保非登录 shell 也能加载）..."
+
+GLOBAL_BASHRC="/etc/bash.bashrc"
+
+# 检查是否已添加
+if ! grep -q "source /etc/profile.d/terminal-tools.sh" "$GLOBAL_BASHRC" 2>/dev/null; then
+    sudo tee -a "$GLOBAL_BASHRC" > /dev/null << 'EOF'
+
+# === Load Terminal Tools Config ===
+if [ -f /etc/profile.d/terminal-tools.sh ]; then
+    source /etc/profile.d/terminal-tools.sh
+fi
+EOF
+    print_success "已在 $GLOBAL_BASHRC 中添加配置加载"
+else
+    print_warning "$GLOBAL_BASHRC 配置已存在，跳过"
+fi
+
+# ============================================
 # 4. 配置当前用户的 shell 配置文件（保留，作为备份）
 # ============================================
 print_status "配置当前用户的 shell 配置文件..."
@@ -240,20 +261,20 @@ EOF
 fi
 
 # ============================================
-# 5. 配置 tmux
+# 5. 配置 tmux（全局配置）
 # ============================================
-print_status "配置 tmux..."
+print_status "配置 tmux（全局配置）..."
 
-TMUX_CONF="$HOME/.tmux.conf"
+TMUX_CONF="/etc/tmux.conf"
 
 if [ -f "$TMUX_CONF" ]; then
-    cp "$TMUX_CONF" "${TMUX_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
+    sudo cp "$TMUX_CONF" "${TMUX_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
     print_status "已备份 $TMUX_CONF"
 fi
 
-cat > "$TMUX_CONF" << 'EOF'
+sudo tee "$TMUX_CONF" > /dev/null << 'EOF'
 # ============================================
-# tmux 配置文件
+# tmux 全局配置文件
 # ============================================
 
 # ----- 基础设置 -----
@@ -298,7 +319,7 @@ bind -n C-Up resize-pane -U 2
 bind -n C-Down resize-pane -D 2
 
 # r 重新加载配置
-bind r source-file ~/.tmux.conf \; display-message "Config reloaded!"
+bind r source-file /etc/tmux.conf \; display-message "Config reloaded!"
 
 # ----- 状态栏设置 -----
 # 状态栏位置
@@ -351,7 +372,7 @@ bind -T copy-mode-vi y send-keys -X copy-selection-and-cancel
 # ============================================
 EOF
 
-print_success "tmux 配置已写入 $TMUX_CONF"
+print_success "tmux 全局配置已写入 $TMUX_CONF"
 
 # ============================================
 # 6. 完成
@@ -373,9 +394,10 @@ echo "  ✓ ncdu     - 磁盘分析"
 echo "  ✓ tmux     - 终端复用"
 echo ""
 echo "配置文件："
-echo "  ✓ 全局配置: $GLOBAL_SCRIPT (所有用户生效)"
-echo "  ✓ 当前用户: $SHELL_RC"
-echo "  ✓ tmux配置: $TMUX_CONF"
+echo "  ✓ 全局别名配置: $GLOBAL_SCRIPT (登录 shell 加载)"
+echo "  ✓ 全局bash配置: $GLOBAL_BASHRC (所有 bash 加载)"
+echo "  ✓ 全局tmux配置: $TMUX_CONF (所有用户生效)"
+echo "  ✓ 当前用户配置: $SHELL_RC"
 echo ""
 echo "配置的别名："
 echo "  cat  → batcat (语法高亮)"
@@ -385,9 +407,9 @@ echo "  la   → eza -la --icons --git"
 echo "  lt   → eza --tree (树形显示)"
 echo "  fd   → fdfind"
 echo ""
-print_warning "请执行以下命令使配置生效："
+print_warning "请执行以下命令使配置立即生效："
 echo ""
-echo "  source $SHELL_RC"
+echo "  source /etc/profile.d/terminal-tools.sh"
 echo ""
 echo "或者重新登录系统。"
 echo ""
