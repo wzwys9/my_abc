@@ -80,9 +80,94 @@ for tool in $TOOLS; do
 done
 
 # ============================================
-# 3. 配置别名和初始化
+# 3. 创建全局配置脚本（所有用户生效）
 # ============================================
-print_status "配置别名和初始化..."
+print_status "创建全局配置脚本..."
+
+GLOBAL_SCRIPT="/etc/profile.d/terminal-tools.sh"
+
+sudo tee "$GLOBAL_SCRIPT" > /dev/null << 'EOF'
+#!/bin/bash
+
+# ============================================
+# 终端工具全局别名配置
+# 适用于所有用户
+# ============================================
+
+# ----- bat (语法高亮的 cat) -----
+if command -v batcat &> /dev/null; then
+    alias cat='batcat'
+    alias bat='batcat'
+fi
+
+# ----- eza (更好的 ls) -----
+if command -v eza &> /dev/null; then
+    alias ls='eza --icons'
+    alias ll='eza -l --icons --git'
+    alias la='eza -la --icons --git'
+    alias lt='eza --tree --level=2 --icons'
+fi
+
+# ----- fd (更好的 find) -----
+if command -v fdfind &> /dev/null; then
+    alias fd='fdfind'
+fi
+
+# ----- ripgrep (更好的 grep) -----
+# rg 命令本身就是 ripgrep，无需别名
+
+# ----- zoxide (智能目录跳转) -----
+if command -v zoxide &> /dev/null; then
+    # 根据当前 shell 类型初始化
+    if [ -n "$ZSH_VERSION" ]; then
+        eval "$(zoxide init zsh)"
+    elif [ -n "$BASH_VERSION" ]; then
+        eval "$(zoxide init bash)"
+    fi
+fi
+
+# ----- fzf (模糊搜索) -----
+if command -v fzf &> /dev/null; then
+    # 启用 fzf 快捷键绑定（bash）
+    if [ -n "$BASH_VERSION" ]; then
+        if [ -f /usr/share/doc/fzf/examples/key-bindings.bash ]; then
+            source /usr/share/doc/fzf/examples/key-bindings.bash
+        fi
+        if [ -f /usr/share/doc/fzf/examples/completion.bash ]; then
+            source /usr/share/doc/fzf/examples/completion.bash
+        fi
+    fi
+    
+    # 启用 fzf 快捷键绑定（zsh）
+    if [ -n "$ZSH_VERSION" ]; then
+        if [ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]; then
+            source /usr/share/doc/fzf/examples/key-bindings.zsh
+        fi
+        if [ -f /usr/share/doc/fzf/examples/completion.zsh ]; then
+            source /usr/share/doc/fzf/examples/completion.zsh
+        fi
+    fi
+    
+    # fzf 默认选项
+    export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
+    
+    # 如果有 fd，用 fd 作为 fzf 的默认搜索命令
+    if command -v fdfind &> /dev/null; then
+        export FZF_DEFAULT_COMMAND='fdfind --type f --hidden --follow --exclude .git'
+        export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+        export FZF_ALT_C_COMMAND='fdfind --type d --hidden --follow --exclude .git'
+    fi
+fi
+EOF
+
+# 添加可执行权限
+sudo chmod +x "$GLOBAL_SCRIPT"
+print_success "全局配置脚本已创建: $GLOBAL_SCRIPT"
+
+# ============================================
+# 4. 配置当前用户的 shell 配置文件（保留，作为备份）
+# ============================================
+print_status "配置当前用户的 shell 配置文件..."
 
 # 备份原配置文件
 if [ -f "$SHELL_RC" ]; then
@@ -155,7 +240,7 @@ EOF
 fi
 
 # ============================================
-# 4. 配置 tmux
+# 5. 配置 tmux
 # ============================================
 print_status "配置 tmux..."
 
@@ -269,7 +354,7 @@ EOF
 print_success "tmux 配置已写入 $TMUX_CONF"
 
 # ============================================
-# 5. 完成
+# 6. 完成
 # ============================================
 echo ""
 echo "============================================"
@@ -287,6 +372,11 @@ echo "  ✓ btop     - 系统监控"
 echo "  ✓ ncdu     - 磁盘分析"
 echo "  ✓ tmux     - 终端复用"
 echo ""
+echo "配置文件："
+echo "  ✓ 全局配置: $GLOBAL_SCRIPT (所有用户生效)"
+echo "  ✓ 当前用户: $SHELL_RC"
+echo "  ✓ tmux配置: $TMUX_CONF"
+echo ""
 echo "配置的别名："
 echo "  cat  → batcat (语法高亮)"
 echo "  ls   → eza --icons"
@@ -299,7 +389,7 @@ print_warning "请执行以下命令使配置生效："
 echo ""
 echo "  source $SHELL_RC"
 echo ""
-echo "或者重新打开终端。"
+echo "或者重新登录系统。"
 echo ""
 echo "tmux 快速开始："
 echo "  tmux              # 启动"
