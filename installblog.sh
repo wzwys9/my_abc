@@ -20,7 +20,7 @@
 # ✨ 功能特性：
 #   - 自动安装 Docker 和 Docker Compose
 #   - 自动申请 Let's Encrypt SSL 证书
-#   - SSL 证书每 12 小时自动检查续期
+#   - SSL 证书每周自动检查续期
 #   - 完整的 WordPress + MySQL + Nginx 环境
 #   - 交互式配置，无需修改脚本
 #
@@ -129,7 +129,7 @@ collect_user_input() {
     print_header "配置信息收集"
     
     # 域名
-    read -p "请输入你的域名（例如: blog.wzwzh.com）: " DOMAIN
+    read -p "请输入你的域名（例如: blog.example.com）: " DOMAIN
     while [ -z "$DOMAIN" ]; do
         print_error "域名不能为空！"
         read -p "请输入你的域名: " DOMAIN
@@ -216,8 +216,6 @@ create_docker_compose() {
     print_header "创建 Docker Compose 配置"
     
     cat > docker-compose.yml <<EOF
-version: '3.8'
-
 services:
   # MySQL 数据库
   db:
@@ -265,30 +263,15 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d
       - ./nginx/ssl:/etc/nginx/ssl
       - wordpress_data:/var/www/html:ro
-      - certbot_webroot:/var/www/certbot:ro
-      - certbot_certs:/etc/letsencrypt:ro
+      - /root/letsencrypt:/etc/letsencrypt:ro
     depends_on:
       - wordpress
-    networks:
-      - blog_network
-
-  # Certbot 用于 SSL 证书管理
-  certbot:
-    image: certbot/certbot
-    container_name: blog_certbot
-    restart: unless-stopped
-    volumes:
-      - certbot_certs:/etc/letsencrypt
-      - certbot_webroot:/var/www/certbot
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot --webroot-path=/var/www/certbot --quiet; sleep 12h & wait \$\${!}; done;'"
     networks:
       - blog_network
 
 volumes:
   db_data:
   wordpress_data:
-  certbot_certs:
-  certbot_webroot:
 
 networks:
   blog_network:
@@ -304,17 +287,11 @@ create_nginx_config() {
     print_header "创建 Nginx 配置"
     
     cat > nginx/conf.d/blog.conf <<EOF
-# HTTP 配置 - 用于 SSL 证书申请
+# HTTP 配置 - 临时使用
 server {
     listen 80;
     server_name ${DOMAIN};
 
-    # Let's Encrypt 验证路径
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    # 临时允许 HTTP 访问
     location / {
         proxy_pass http://wordpress:80;
         proxy_set_header Host \$host;
@@ -331,26 +308,18 @@ EOF
 
 # 创建 Nginx HTTPS 配置模板
 create_nginx_ssl_config() {
-    cat > nginx/conf.d/blog-ssl.conf <<EOF
+    cat > nginx/conf.d/blog.conf <<EOF
 # HTTP 重定向到 HTTPS
 server {
     listen 80;
     server_name ${DOMAIN};
-
-    # Let's Encrypt 验证路径
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    # 重定向到 HTTPS
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+    return 301 https://\$host\$request_uri;
 }
 
 # HTTPS 配置
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name ${DOMAIN};
 
     # SSL 证书
@@ -447,24 +416,47 @@ start_docker_services() {
     echo ""
 }
 
-# 申请 SSL 证书
+# 申请 SSL 证书（使用 standalone 模式）
 request_ssl_certificate() {
     print_header "申请 SSL 证书"
     
     print_info "正在向 Let's Encrypt 申请证书..."
+    print_warning "此过程可能需要 1-3 分钟，请耐心等待"
+    echo ""
     
-    if docker-compose run --rm certbot certonly \
-        --webroot \
-        --webroot-path=/var/www/certbot \
+    # 停止 Nginx 以释放 80 端口
+    docker-compose stop nginx
+    
+    # 使用 standalone 模式申请证书
+    if docker run --rm -it \
+        -p 80:80 \
+        -p 443:443 \
+        -v /root/letsencrypt:/etc/letsencrypt \
+        -v /root/letsencrypt-lib:/var/lib/letsencrypt \
+        certbot/certbot certonly \
+        --standalone \
         --email $EMAIL \
         --agree-tos \
         --no-eff-email \
         -d $DOMAIN; then
         
         print_success "SSL 证书申请成功！"
+        
+        # 设置证书文件权限
+        chmod -R 755 /root/letsencrypt/archive/ 2>/dev/null || true
+        chmod -R 755 /root/letsencrypt/live/ 2>/dev/null || true
+        
         return 0
     else
         print_error "SSL 证书申请失败"
+        
+        echo ""
+        print_warning "常见失败原因："
+        echo "1. DNS 解析未生效 - 使用 'nslookup $DOMAIN' 检查"
+        echo "2. 80 端口未开放 - 使用 'ufw allow 80' 开放端口"
+        echo "3. Let's Encrypt 限流 - 同一域名每小时最多 5 次失败尝试"
+        echo ""
+        
         return 1
     fi
 }
@@ -476,13 +468,46 @@ switch_to_https() {
     # 创建 HTTPS 配置
     create_nginx_ssl_config
     
-    # 替换配置文件
-    mv nginx/conf.d/blog-ssl.conf nginx/conf.d/blog.conf
-    
-    # 重载 Nginx
-    docker-compose exec nginx nginx -s reload
+    # 启动 Nginx
+    docker-compose start nginx
     
     print_success "HTTPS 配置已启用"
+    echo ""
+}
+
+# 创建证书自动续期脚本
+create_renewal_script() {
+    print_header "配置证书自动续期"
+    
+    cat > /root/renew-cert.sh <<'EOF'
+#!/bin/bash
+# SSL 证书自动续期脚本
+
+cd /root
+
+# 停止 Nginx（释放 80 端口）
+docker-compose stop nginx
+
+# 续期证书
+docker run --rm \
+  -p 80:80 \
+  -p 443:443 \
+  -v /root/letsencrypt:/etc/letsencrypt \
+  -v /root/letsencrypt-lib:/var/lib/letsencrypt \
+  certbot/certbot renew --quiet
+
+# 启动 Nginx
+docker-compose start nginx
+
+echo "$(date): 证书续期检查完成" >> /var/log/certbot-renew.log
+EOF
+    
+    chmod +x /root/renew-cert.sh
+    
+    # 添加到 cron（每周一凌晨 3 点检查）
+    (crontab -l 2>/dev/null | grep -v renew-cert.sh; echo "0 3 * * 1 /root/renew-cert.sh >> /var/log/certbot-renew.log 2>&1") | crontab -
+    
+    print_success "证书自动续期已配置（每周一凌晨 3 点检查）"
     echo ""
 }
 
@@ -505,8 +530,9 @@ show_result() {
     echo "查看日志: docker-compose logs -f"
     echo "重启服务: docker-compose restart"
     echo "停止服务: docker-compose down"
+    echo "备份数据库: docker-compose exec db mysqldump -u wordpress -p wordpress > backup.sql"
     echo ""
-    echo -e "${GREEN}SSL 证书会每 12 小时自动检查更新，无需手动操作${NC}"
+    echo -e "${GREEN}SSL 证书会每周自动检查更新，无需手动操作${NC}"
     echo ""
 }
 
@@ -523,18 +549,20 @@ show_failure() {
     echo ""
     echo -e "${YELLOW}临时访问地址:${NC} http://$DOMAIN"
     echo ""
-    echo -e "${YELLOW}解决方案:${NC}"
-    echo "1. 检查 DNS 解析: nslookup $DOMAIN"
-    echo "2. 检查防火墙: ufw status"
-    echo "3. 检查端口: netstat -tlnp | grep :80"
-    echo ""
     echo -e "${YELLOW}修复后手动申请证书:${NC}"
-    echo "docker-compose run --rm certbot certonly \\"
-    echo "  --webroot --webroot-path=/var/www/certbot \\"
+    echo "docker-compose stop nginx"
+    echo "docker run --rm -it \\"
+    echo "  -p 80:80 -p 443:443 \\"
+    echo "  -v /root/letsencrypt:/etc/letsencrypt \\"
+    echo "  -v /root/letsencrypt-lib:/var/lib/letsencrypt \\"
+    echo "  certbot/certbot certonly --standalone \\"
     echo "  --email $EMAIL --agree-tos --no-eff-email -d $DOMAIN"
     echo ""
-    echo "申请成功后切换配置:"
-    echo "./$(basename $0)"
+    echo "chmod -R 755 /root/letsencrypt/archive/"
+    echo "chmod -R 755 /root/letsencrypt/live/"
+    echo ""
+    echo "然后创建 HTTPS 配置并启动："
+    echo "./renew-cert.sh  # 或手动执行上面的命令"
     echo ""
 }
 
@@ -571,8 +599,11 @@ main() {
     # 申请 SSL 证书
     if request_ssl_certificate; then
         switch_to_https
+        create_renewal_script
         show_result
     else
+        # 即使证书申请失败，也启动 Nginx（使用 HTTP）
+        docker-compose start nginx
         show_failure
     fi
 }
