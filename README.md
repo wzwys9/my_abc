@@ -4,5 +4,5 @@
 删除了大佬脚本里的很多分流，为了用socks代理转发而用
 因为前段时间买了几个isp静态住宅，使用链式代理不方便，所以才有此想法
 
-
+脚本调用
 `bash <(curl -L https://raw.githubusercontent.com/wzwys9/my_abc/main/install.sh)`
