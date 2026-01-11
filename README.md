@@ -6,3 +6,7 @@
 
 脚本调用
 `bash <(curl -L https://raw.githubusercontent.com/wzwys9/my_abc/main/install.sh)`
+
+
+sudo apt purge -y fzf bat eza fd-find ripgrep btop ncdu tmux
+sudo apt autoremove -y
