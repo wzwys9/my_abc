@@ -9,4 +9,5 @@
 
 
 sudo apt purge -y fzf bat eza fd-find ripgrep btop ncdu tmux
+
 sudo apt autoremove -y
