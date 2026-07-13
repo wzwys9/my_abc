@@ -855,8 +855,7 @@ configure_socks5() {
     read_yes_no "是否需要用户名密码认证?" "n" && auth_needed="y" || auth_needed="n"
     if [[ "$auth_needed" == "y" ]]; then
         read -r -p "请输入用户名: " socks5_user
-        read -r -s -p "请输入密码: " socks5_pass
-        echo
+        read -r -p "请输入密码: " socks5_pass
     fi
 
     # UDP设置
