@@ -111,13 +111,33 @@ validate_port() {
 # 验证UUID格式
 validate_uuid() {
     local uuid=$1
-    [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
 # 验证ShortID格式
 validate_shortid() {
     local shortid=$1
-    [[ ${#shortid} -le 16 ]] && [[ $(( ${#shortid} % 2 )) -eq 0 ]]
+    [[ "$shortid" =~ ^([0-9a-fA-F]{2}){0,8}$ ]]
+}
+
+# 验证SNI域名，避免无效REALITY配置
+validate_domain() {
+    local domain=$1
+    [[ ${#domain} -le 253 ]] &&
+        [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+
+# 验证SOCKS5主机名/IP，拒绝空白和HAProxy配置注入字符
+validate_proxy_host() {
+    local host=$1
+    [[ -n "$host" && ${#host} -le 253 ]] || return 1
+    [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+    [[ "$host" != .* && "$host" != *. && "$host" != *..* ]]
+}
+
+validate_positive_int() {
+    local value=$1 max=${2:-2147483647}
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= max ))
 }
 
 # 读取y/n确认
@@ -143,7 +163,7 @@ read_port_input() {
             continue
         fi
 
-        eval "$varname=$port"
+        printf -v "$varname" '%s' "$port"
         return 0
     done
 }
@@ -155,6 +175,8 @@ read_port_input() {
 # 获取公共IP
 get_public_ip() {
     local ip_type=$1 interface=$2 timeout=3
+    local -a curl_args=(-"${ip_type}" -fsS -m "$timeout")
+    [[ -n "$interface" ]] && curl_args+=(--interface "$interface")
     local ip_apis=(
         "https://www.cloudflare.com/cdn-cgi/trace"
         "https://api.ipify.org"
@@ -166,10 +188,12 @@ get_public_ip() {
     for api in "${ip_apis[@]}"; do
         local ip
         if [[ $api == "https://www.cloudflare.com/cdn-cgi/trace" ]]; then
-            ip=$(curl -"${ip_type}"s --interface "$interface" -m "$timeout" "$api" 2>/dev/null | grep -oP "ip=\K.*$")
+            ip=$(curl "${curl_args[@]}" "$api" 2>/dev/null | sed -n 's/^ip=//p')
         else
-            ip=$(curl -"${ip_type}"s --interface "$interface" -m "$timeout" "$api" 2>/dev/null)
+            ip=$(curl "${curl_args[@]}" "$api" 2>/dev/null)
         fi
+        ip=${ip//$'\r'/}
+        ip=${ip//$'\n'/}
 
         if [[ -n "$ip" && $ip =~ ^[0-9a-fA-F:.]+$ ]]; then
             echo "$ip"
@@ -185,7 +209,13 @@ get_local_ips() {
     IPv4="" IPv6=""
 
     # 获取网络接口列表
-    local InFaces=($(ls /sys/class/net/ 2>/dev/null | grep -E '^(eth|ens|eno|esp|enp|venet|vif)'))
+    local InFaces=()
+    local iface iface_path
+    for iface_path in /sys/class/net/*; do
+        [[ -e "$iface_path" ]] || continue
+        iface=${iface_path##*/}
+        [[ "$iface" =~ ^(eth|ens|eno|esp|enp|venet|vif) ]] && InFaces+=("$iface")
+    done
 
     for i in "${InFaces[@]}"; do
         msg_info "正在检测接口 $i ..."
@@ -328,31 +358,25 @@ save_port_info() {
     local port=$1 uuid=$2 private_key=$3 public_key=$4 shortid=$5 domain=$6
 
     if check_port_exists "$port"; then
-        # 更新已存在的端口配置
-        jq "(.ports[] | select(.port == $port)) |= {
-            \"port\": $port,
-            \"uuid\": \"$uuid\",
-            \"private_key\": \"$private_key\",
-            \"public_key\": \"$public_key\",
-            \"shortid\": \"$shortid\",
-            \"domain\": \"$domain\",
-            \"socks5\": (.socks5 // null),
-            \"haproxy\": (.haproxy // null)
-        }" "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
+        # 更新已存在的端口配置；所有字符串均通过--arg传递，避免引号破坏JSON
+        jq --argjson port "$port" --arg uuid "$uuid" --arg private_key "$private_key" \
+            --arg public_key "$public_key" --arg shortid "$shortid" --arg domain "$domain" \
+            '(.ports[] | select(.port == $port)) |= {
+                port: $port, uuid: $uuid, private_key: $private_key,
+                public_key: $public_key, shortid: $shortid, domain: $domain,
+                socks5: (.socks5 // null), haproxy: (.haproxy // null)
+            }' "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
     else
         # 添加新端口
-        jq ".ports += [{
-            \"port\": $port,
-            \"uuid\": \"$uuid\",
-            \"private_key\": \"$private_key\",
-            \"public_key\": \"$public_key\",
-            \"shortid\": \"$shortid\",
-            \"domain\": \"$domain\",
-            \"socks5\": null,
-            \"haproxy\": null
-        }]" "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
+        jq --argjson port "$port" --arg uuid "$uuid" --arg private_key "$private_key" \
+            --arg public_key "$public_key" --arg shortid "$shortid" --arg domain "$domain" \
+            '.ports += [{port: $port, uuid: $uuid, private_key: $private_key,
+                public_key: $public_key, shortid: $shortid, domain: $domain,
+                socks5: null, haproxy: null}]' \
+            "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
     fi
 
+    jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
     mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
     chmod 600 "$PORT_INFO_FILE"
     log_info "保存端口 $port 配置"
@@ -361,7 +385,7 @@ save_port_info() {
 # 删除端口信息
 delete_port_info() {
     local port=$1
-    jq "del(.ports[] | select(.port == $port))" "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
+    jq --argjson port "$port" 'del(.ports[] | select(.port == $port))' "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
     mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
     chmod 600 "$PORT_INFO_FILE"
     log_info "删除端口 $port 配置"
@@ -386,7 +410,13 @@ set_port_socks5_config() {
         socks5_config="null"
     fi
 
-    jq "(.ports[] | select(.port == $port)) |= (.socks5 = $socks5_config)" "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
+    if ! jq --argjson port "$port" --argjson config "$socks5_config" \
+        '(.ports[] | select(.port == $port)).socks5 = $config' \
+        "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"; then
+        rm -f "${PORT_INFO_FILE}.tmp"
+        return 1
+    fi
+    jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
     mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
     chmod 600 "$PORT_INFO_FILE"
     log_info "设置端口 $port 的SOCKS5配置"
@@ -398,12 +428,25 @@ set_port_haproxy_config() {
 
     local haproxy_config
     if [[ "$enabled" == "y" ]]; then
-        haproxy_config="{\"enabled\": true, \"port\": $haproxy_port, \"threads\": $threads, \"maxconn\": $maxconn}"
+        validate_port "$port" && validate_port "$haproxy_port" && \
+            validate_positive_int "$threads" 256 && validate_positive_int "$maxconn" 1000000 || {
+                echo -e "${RED}HAProxy端口、线程数或最大连接数无效${NONE}"
+                return 1
+            }
+        haproxy_config=$(jq -n --argjson port "$haproxy_port" --argjson threads "$threads" \
+            --argjson maxconn "$maxconn" \
+            '{enabled: true, port: $port, threads: $threads, maxconn: $maxconn}') || return 1
     else
         haproxy_config="null"
     fi
 
-    jq "(.ports[] | select(.port == $port)) |= (.haproxy = $haproxy_config)" "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
+    if ! jq --argjson port "$port" --argjson config "$haproxy_config" \
+        '(.ports[] | select(.port == $port)).haproxy = $config' \
+        "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"; then
+        rm -f "${PORT_INFO_FILE}.tmp"
+        return 1
+    fi
+    jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
     mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
     chmod 600 "$PORT_INFO_FILE"
     log_info "设置端口 $port 的HAProxy配置"
@@ -453,67 +496,55 @@ preserve_port_proxy_config() {
 build_inbound_config() {
     local port=$1 uuid=$2 private_key=$3 shortid=$4 domain=$5
 
-    cat << EOL
-{
-  "listen": "0.0.0.0",
-  "port": ${port},
-  "protocol": "vless",
-  "settings": {
-    "clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "show": false,
-      "dest": "${domain}:443",
-      "xver": 0,
-      "serverNames": ["${domain}"],
-      "privateKey": "${private_key}",
-      "shortIds": ["", "${shortid}"]
-    }
-  },
-  "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true},
-  "tag": "inbound-${port}"
-}
-EOL
+    jq -n --argjson port "$port" --arg uuid "$uuid" --arg private_key "$private_key" \
+        --arg shortid "$shortid" --arg domain "$domain" \
+        '{
+            listen: "0.0.0.0", port: $port, protocol: "vless",
+            settings: {clients: [{id: $uuid, flow: "xtls-rprx-vision"}], decryption: "none"},
+            streamSettings: {
+                network: "tcp", security: "reality",
+                realitySettings: {
+                    show: false, dest: ($domain + ":443"), xver: 0,
+                    serverNames: [$domain], privateKey: $private_key,
+                    shortIds: ["", $shortid]
+                }
+            },
+            sniffing: {enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true},
+            tag: ("inbound-" + ($port | tostring))
+        }'
 }
 
 # 构建SOCKS5出站配置
 build_socks5_outbound() {
     local port=$1 address=$2 socks_port=$3 auth_needed=$4 user=$5 pass=$6 udp_over_tcp=$7
-    local tag="socks5-out-$port"
+    local auth_json=false udp_json=false
+    [[ "$auth_needed" == "true" && -n "$user" && -n "$pass" ]] && auth_json=true
+    [[ "$udp_over_tcp" == "true" ]] && udp_json=true
 
-    local servers_config="\"address\": \"$address\", \"port\": $socks_port"
-    if [[ "$auth_needed" == "true" && -n "$user" && -n "$pass" ]]; then
-        servers_config="$servers_config, \"users\": [{\"user\": \"$user\", \"pass\": \"$pass\"}]"
-    fi
-
-    local stream_config
-    if [[ "$udp_over_tcp" == "true" ]]; then
-        stream_config='"sockopt": {"udpFragmentSize": 1400, "tcpFastOpen": true, "tcpKeepAliveInterval": 15, "mark": 255}'
-    else
-        stream_config='"sockopt": {"tcpFastOpen": true, "tcpKeepAliveInterval": 15, "tcpMptcp": true, "tcpNoDelay": true, "mark": 255}'
-    fi
-
-    cat << EOL
-{
-  "protocol": "socks",
-  "settings": {"servers": [{$servers_config}]},
-  "streamSettings": {$stream_config},
-  "tag": "$tag"
-}
-EOL
+    jq -n --argjson port "$port" --arg address "$address" --argjson socks_port "$socks_port" \
+        --argjson auth "$auth_json" --arg user "$user" --arg pass "$pass" --argjson udp "$udp_json" \
+        '{
+            protocol: "socks",
+            settings: {servers: [({address: $address, port: $socks_port} +
+                (if $auth then {users: [{user: $user, pass: $pass}]} else {} end))]},
+            streamSettings: {sockopt:
+                (if $udp then
+                    {udpFragmentSize: 1400, tcpFastOpen: true, tcpKeepAliveInterval: 15, mark: 255}
+                 else
+                    {tcpFastOpen: true, tcpKeepAliveInterval: 15, tcpMptcp: true, tcpNoDelay: true, mark: 255}
+                 end)},
+            tag: ("socks5-out-" + ($port | tostring))
+        }'
 }
 
 # 更新Xray配置文件
 update_config_file() {
-    # 备份当前配置
-    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$CONFIG_DIR"
+    local temp_config
+    temp_config=$(mktemp "${CONFIG_DIR}/.config.json.tmp.XXXXXX") || return 1
 
-    # 创建基本配置
-    cat > "$CONFIG_FILE" << 'EOL'
+    # 始终先在临时文件中完整生成，验证成功后才替换线上配置
+    cat > "$temp_config" << 'EOL'
 {
   "log": {"loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log"},
   "dns": {
@@ -536,9 +567,6 @@ update_config_file() {
 }
 EOL
 
-    local temp_config=$(mktemp)
-    cp "$CONFIG_FILE" "$temp_config"
-
     # 处理每个端口配置
     while read -r port_info; do
         [[ -z "$port_info" ]] && continue
@@ -551,7 +579,7 @@ EOL
 
         # 添加入站配置
         local inbound=$(build_inbound_config "$port" "$uuid" "$private_key" "$shortid" "$domain")
-        jq ".inbounds += [$inbound]" "$temp_config" > "${temp_config}.new"
+        jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$temp_config" > "${temp_config}.new"
         mv "${temp_config}.new" "$temp_config"
 
         # 处理SOCKS5配置
@@ -576,36 +604,59 @@ EOL
             # 添加SOCKS5出站
             local socks5_outbound=$(build_socks5_outbound "$port" "$socks5_address" "$socks5_port" \
                 "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp")
-            jq ".outbounds += [$socks5_outbound]" "$temp_config" > "${temp_config}.new"
+            jq --argjson outbound "$socks5_outbound" '.outbounds += [$outbound]' "$temp_config" > "${temp_config}.new"
             mv "${temp_config}.new" "$temp_config"
 
             # 添加路由规则
-            local rule='{"type": "field", "inboundTag": ["inbound-'$port'"], "outboundTag": "socks5-out-'$port'"}'
-            jq ".routing.rules += [$rule]" "$temp_config" > "${temp_config}.new"
+            jq --arg port "$port" '.routing.rules += [{
+                type: "field",
+                inboundTag: [("inbound-" + $port)],
+                outboundTag: ("socks5-out-" + $port)
+            }]' "$temp_config" > "${temp_config}.new"
             mv "${temp_config}.new" "$temp_config"
         fi
     done < <(jq -c '.ports[]' "$PORT_INFO_FILE")
 
-    cp "$temp_config" "$CONFIG_FILE"
-    chmod 644 "$CONFIG_FILE"
-    rm -f "$temp_config" "${temp_config}.new"
+    if ! jq -e . "$temp_config" >/dev/null; then
+        echo -e "${RED}生成的Xray配置不是有效JSON，已保留原配置${NONE}"
+        rm -f "$temp_config" "${temp_config}.new"
+        return 1
+    fi
+
+    # 先验证配置，再原子替换，防止错误配置导致服务无法启动
+    if command -v xray >/dev/null 2>&1 && ! xray run -test -config "$temp_config" >/dev/null 2>&1; then
+        echo -e "${RED}Xray配置验证失败，已保留原配置${NONE}"
+        xray run -test -config "$temp_config" 2>&1
+        rm -f "$temp_config" "${temp_config}.new"
+        return 1
+    fi
+
+    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    chmod 644 "$temp_config"
+    mv -f "$temp_config" "$CONFIG_FILE"
+    rm -f "${temp_config}.new"
     log_info "配置文件已更新"
 }
 
 # 更新HAProxy配置文件
 update_haproxy_config() {
-    mkdir -p /etc/haproxy
-    [[ -f "$HAPROXY_CONFIG" ]] && cp "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    local haproxy_dir
+    haproxy_dir=$(dirname "$HAPROXY_CONFIG")
+    mkdir -p "$haproxy_dir"
+    local temp_haproxy
+    temp_haproxy=$(mktemp "${haproxy_dir}/.haproxy.cfg.tmp.XXXXXX") || return 1
 
     # 获取最大线程数
     local max_threads=12
     while read -r port_info; do
-        local threads=$(echo "$port_info" | jq -r '.haproxy.threads // 12')
+        local threads
+        threads=$(echo "$port_info" | jq -r '.haproxy.threads // 12')
+        validate_positive_int "$threads" 256 || { rm -f "$temp_haproxy"; return 1; }
         [[ $threads -gt $max_threads ]] && max_threads=$threads
     done < <(jq -c '.ports[] | select(.haproxy != null and .haproxy.enabled == true)' "$PORT_INFO_FILE")
 
     # 创建基本配置
-    cat > "$HAPROXY_CONFIG" << EOL
+    cat > "$temp_haproxy" << EOL
 global
     maxconn 5000
     nbthread $max_threads
@@ -631,7 +682,14 @@ EOL
         local socks5_address=$(echo "$port_info" | jq -r '.socks5.address')
         local socks5_port=$(echo "$port_info" | jq -r '.socks5.port')
 
-        cat >> "$HAPROXY_CONFIG" << EOL
+        validate_port "$port" && validate_port "$haproxy_port" && validate_port "$socks5_port" &&
+            validate_positive_int "$haproxy_maxconn" 1000000 && validate_proxy_host "$socks5_address" || {
+                echo -e "${RED}HAProxy参数无效，取消更新${NONE}"
+                rm -f "$temp_haproxy"
+                return 1
+            }
+
+        cat >> "$temp_haproxy" << EOL
 frontend socks_front_$port
     bind *:$haproxy_port
     default_backend socks_servers_$port
@@ -642,7 +700,16 @@ backend socks_servers_$port
 EOL
     done < <(jq -c '.ports[] | select(.haproxy != null and .haproxy.enabled == true)' "$PORT_INFO_FILE")
 
-    # 重启HAProxy
+    # 临时配置验证成功后才替换线上文件
+    if ! haproxy -c -f "$temp_haproxy"; then
+        echo -e "${RED}HAProxy配置验证失败，原配置未修改${NONE}"
+        rm -f "$temp_haproxy"
+        return 1
+    fi
+
+    [[ -f "$HAPROXY_CONFIG" ]] && cp "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    chmod 644 "$temp_haproxy"
+    mv -f "$temp_haproxy" "$HAPROXY_CONFIG"
     restart_haproxy
 }
 
@@ -652,7 +719,8 @@ EOL
 
 # 检查依赖
 check_dependencies() {
-    local dependencies=("curl" "jq" "qrencode" "lsof" "wget" "systemctl" "haproxy")
+    # HAProxy仅在配置SOCKS5转发时安装，避免脚本一启动就安装并启用服务
+    local dependencies=("curl" "jq" "qrencode" "lsof" "wget" "systemctl")
     local missing=()
 
     for dep in "${dependencies[@]}"; do
@@ -729,16 +797,19 @@ check_xray_service() {
 
 # 生成默认UUID
 generate_default_uuid() {
-    local ip=$1 port=$2
-    local seed="${ip}$(cat /proc/sys/kernel/hostname 2>/dev/null)$(cat /etc/timezone 2>/dev/null)${port}$(date +%s%N)"
-    curl -sL "https://www.uuidtools.com/api/generate/v3/namespace/ns:dns/name/${seed}" | grep -oP '[^-]{8}-[^-]{4}-[^-]{4}-[^-]{4}-[^-]{12}'
+    if command -v xray >/dev/null 2>&1; then
+        xray uuid 2>/dev/null && return 0
+    fi
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        tr 'A-F' 'a-f' < /proc/sys/kernel/random/uuid
+        return 0
+    fi
+    command -v uuidgen >/dev/null 2>&1 && uuidgen | tr 'A-F' 'a-f'
 }
 
 # 生成密钥对
 generate_keys() {
-    local uuid=$1
-    local seed=$(echo -n "${uuid}" | md5sum | head -c 32 | base64 -w 0 | tr '+/' '-_' | tr -d '=')
-    xray x25519 -i "${seed}" 2>/dev/null
+    xray x25519 2>/dev/null
 }
 
 # 查找可用端口
@@ -748,7 +819,8 @@ find_available_port() {
     while lsof -i:"$port" >/dev/null 2>&1 || check_port_exists "$port"; do
         port=$((port + 1))
     done
-    echo $port
+    validate_port "$port" || return 1
+    echo "$port"
 }
 
 # 配置SOCKS5代理
@@ -759,10 +831,11 @@ configure_socks5() {
     # 获取SOCKS5地址
     while :; do
         read -p "请输入 SOCKS5 服务器地址: " socks5_address
-        if [[ -z "$socks5_address" ]]; then
-            msg_error; continue
+        if ! validate_proxy_host "$socks5_address"; then
+            echo -e "${RED}错误: 请输入合法的IP地址或主机名${NONE}"
+            continue
         fi
-        if [[ "$socks5_address" == "127.0.0.1" || "$socks5_address" == "localhost" ]]; then
+        if [[ "$socks5_address" == "127.0.0.1" || "$socks5_address" == "localhost" || "$socks5_address" == "::1" ]]; then
             echo -e "${RED}错误: 不能使用本地地址${NONE}"
             continue
         fi
@@ -781,8 +854,8 @@ configure_socks5() {
     # 认证设置
     read_yes_no "是否需要用户名密码认证?" "n" && auth_needed="y" || auth_needed="n"
     if [[ "$auth_needed" == "y" ]]; then
-        read -p "请输入用户名: " socks5_user
-        read -p "请输入密码: " socks5_pass
+        read -r -p "请输入用户名: " socks5_user
+        read -r -s -p "请输入密码: " socks5_pass
         echo
     fi
 
@@ -793,7 +866,19 @@ configure_socks5() {
     set_port_socks5_config "$port" "y" "$socks5_address" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp"
 
     # 自动配置HAProxy
-    local haproxy_port=$(find_available_port $((port + 10)))
+    if ! command -v haproxy >/dev/null 2>&1; then
+        msg_info "正在安装HAProxy..."
+        apt-get update && apt-get install -y haproxy || {
+            echo -e "${RED}HAProxy安装失败${NONE}"
+            return 1
+        }
+        systemctl enable haproxy >/dev/null 2>&1 || true
+    fi
+    local haproxy_port
+    haproxy_port=$(find_available_port $((port + 10))) || {
+        echo -e "${RED}未找到可用的HAProxy端口${NONE}"
+        return 1
+    }
     set_port_haproxy_config "$port" "y" "$haproxy_port" 12 400
     update_haproxy_config
 
@@ -855,9 +940,14 @@ add_port_configuration() {
     print_line
 
     # 生成密钥
-    local tmp_key=$(generate_keys "$uuid")
-    local private_key=$(echo "$tmp_key" | awk 'NR==1{print $2}')
-    local public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
+    local tmp_key private_key public_key
+    tmp_key=$(generate_keys "$uuid")
+    private_key=$(echo "$tmp_key" | awk -F': ' '/^PrivateKey:/{print $2; exit}')
+    public_key=$(echo "$tmp_key" | awk -F': ' '/^(Password \(PublicKey\)|PublicKey):/{print $2; exit}')
+    [[ -n "$private_key" && -n "$public_key" ]] || {
+        echo -e "${RED}X25519密钥生成或解析失败${NONE}"
+        return 1
+    }
     echo -e "${YELLOW}私钥 = ${CYAN}${private_key}${NONE}"
     echo -e "${YELLOW}公钥 = ${CYAN}${public_key}${NONE}"
     print_line
@@ -877,8 +967,12 @@ add_port_configuration() {
     print_line
 
     # 域名
-    read -p "$(echo -e "请输入SNI域名 (默认: ${CYAN}learn.microsoft.com${NONE}): ")" domain
-    [[ -z "$domain" ]] && domain="learn.microsoft.com"
+    while :; do
+        read -r -p "$(echo -e "请输入SNI域名 (默认: ${CYAN}learn.microsoft.com${NONE}): ")" domain
+        [[ -z "$domain" ]] && domain="learn.microsoft.com"
+        validate_domain "$domain" && break
+        echo -e "${RED}域名格式无效，请输入类似 learn.microsoft.com 的域名${NONE}"
+    done
     echo -e "${YELLOW}SNI = ${CYAN}${domain}${NONE}"
     print_line
 
@@ -891,7 +985,10 @@ add_port_configuration() {
     fi
 
     # 更新配置并重启
-    update_config_file
+    if ! update_config_file; then
+        echo -e "${RED}配置生成或验证失败，未重启Xray${NONE}"
+        return 1
+    fi
     restart_xray
 
     # 生成连接信息
@@ -992,9 +1089,14 @@ modify_port_uuid() {
         break
     done
 
-    local tmp_key=$(generate_keys "$new_uuid")
-    local new_private_key=$(echo "$tmp_key" | awk 'NR==1{print $2}')
-    local new_public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
+    local tmp_key new_private_key new_public_key
+    tmp_key=$(generate_keys "$new_uuid")
+    new_private_key=$(echo "$tmp_key" | awk -F': ' '/^PrivateKey:/{print $2; exit}')
+    new_public_key=$(echo "$tmp_key" | awk -F': ' '/^(Password \(PublicKey\)|PublicKey):/{print $2; exit}')
+    [[ -n "$new_private_key" && -n "$new_public_key" ]] || {
+        echo -e "${RED}X25519密钥生成或解析失败${NONE}"
+        return 1
+    }
     local new_shortid=$(echo -n "${new_uuid}" | sha1sum | head -c 16)
     local domain=$(echo "$port_info" | jq -r '.domain')
 
@@ -1013,8 +1115,12 @@ modify_port_domain() {
 
     echo -e "当前域名: ${CYAN}$old_domain${NONE}"
 
-    read -p "$(echo -e "请输入新域名 (默认: ${CYAN}learn.microsoft.com${NONE}): ")" new_domain
-    [[ -z "$new_domain" ]] && new_domain="learn.microsoft.com"
+    while :; do
+        read -r -p "$(echo -e "请输入新域名 (默认: ${CYAN}learn.microsoft.com${NONE}): ")" new_domain
+        [[ -z "$new_domain" ]] && new_domain="learn.microsoft.com"
+        validate_domain "$new_domain" && break
+        echo -e "${RED}域名格式无效${NONE}"
+    done
 
     save_port_info "$port" \
         "$(echo "$port_info" | jq -r '.uuid')" \
@@ -1073,7 +1179,7 @@ modify_port_socks5() {
 
         if read_yes_no "是否禁用SOCKS5代理?" "n"; then
             set_port_socks5_config "$port" "n" "" "" "" "" "" ""
-            set_port_haproxy_config "$port" "n" "" "" ""
+            set_port_haproxy_config "$port" "n" 1 1 1
             update_haproxy_config
             msg_success "SOCKS5代理已禁用!"
         else
@@ -1436,8 +1542,10 @@ install_xray() {
     print_line
 
     msg_info "安装依赖..."
-    apt update && apt install -y curl sudo jq qrencode net-tools lsof wget haproxy
-    systemctl enable haproxy
+    if ! apt-get update || ! apt-get install -y curl sudo jq qrencode net-tools lsof wget; then
+        echo -e "${RED}依赖安装失败${NONE}"
+        return 1
+    fi
 
     if command -v xray &> /dev/null; then
         if ! read_yes_no "检测到已安装Xray，是否重新安装?" "n"; then
@@ -1612,9 +1720,10 @@ sync_config_from_xray() {
 
         # 生成公钥
         local public_key=""
-        local tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
+        local tmp_key
+        tmp_key=$(xray x25519 -i "${private_key}" 2>/dev/null)
         if [[ -n "$tmp_key" ]]; then
-            public_key=$(echo "$tmp_key" | awk 'NR==2{print $2}')
+            public_key=$(echo "$tmp_key" | awk -F': ' '/^(Password \(PublicKey\)|PublicKey):/{print $2; exit}')
         fi
 
         echo -e "${CYAN}发现端口 $port: UUID=${uuid:0:8}..., 域名=$domain${NONE}"
@@ -1776,14 +1885,20 @@ show_menu() {
     done
 }
 
-# 主入口
-check_root
-init_directories
-check_dependencies
-log_info "脚本启动，版本 $VERSION"
+main() {
+    check_root
+    init_directories
+    check_dependencies || exit 1
+    log_info "脚本启动，版本 $VERSION"
 
-if [[ $# -eq 0 ]]; then
-    show_menu
-else
-    install_xray "$@"
+    if [[ $# -eq 0 ]]; then
+        show_menu
+    else
+        install_xray "$@"
+    fi
+}
+
+# 被测试脚本source时不自动执行
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
