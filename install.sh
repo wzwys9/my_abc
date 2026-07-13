@@ -2,7 +2,7 @@
 
 # ============================================================
 # Xray 多端口管理脚本 - 重构版
-# 版本: 3.0.3
+# 版本: 3.0.4
 # ============================================================
 
 # 等待1秒, 避免curl下载脚本的打印与脚本本身的显示冲突
@@ -23,7 +23,7 @@ readonly CYAN='\e[96m'
 readonly NONE='\e[0m'
 
 # 脚本版本
-readonly VERSION="3.0.3"
+readonly VERSION="3.0.4"
 
 # 配置文件路径
 readonly CONFIG_FILE="/usr/local/etc/xray/config.json"
@@ -31,6 +31,7 @@ readonly CONFIG_DIR="/usr/local/etc/xray"
 readonly PORT_INFO_FILE="$HOME/.xray_port_info.json"
 readonly LOG_FILE="$HOME/.xray_management.log"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+readonly LOCK_FILE="/var/lock/xray-multiport-manager.lock"
 
 # 全局变量
 IPv4=""
@@ -348,6 +349,28 @@ check_port_exists() {
     jq -e ".ports[] | select(.port == $port)" "$PORT_INFO_FILE" > /dev/null 2>&1
 }
 
+# 检查端口是否已被任一VLESS或HAProxy记录占用
+check_managed_port_exists() {
+    local candidate=$1 exclude_port=${2:-0}
+    jq -e --argjson candidate "$candidate" --argjson exclude "$exclude_port" '
+        .ports[] | select(.port != $exclude) |
+        select(.port == $candidate or (.haproxy.port? == $candidate))
+    ' "$PORT_INFO_FILE" >/dev/null 2>&1
+}
+
+validate_haproxy_port_available() {
+    local owner_port=$1 candidate=$2
+    local current=""
+    current=$(jq -r --argjson port "$owner_port" '.ports[] | select(.port == $port) | .haproxy.port // empty' "$PORT_INFO_FILE")
+
+    check_managed_port_exists "$candidate" "$owner_port" && return 1
+    [[ "$candidate" == "$owner_port" ]] && return 1
+    if [[ "$candidate" != "$current" ]] && lsof -i:"$candidate" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
 # 获取端口数量
 get_port_count() {
     jq '.ports | length' "$PORT_INFO_FILE"
@@ -377,17 +400,25 @@ save_port_info() {
     fi
 
     jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
-    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
-    chmod 600 "$PORT_INFO_FILE"
+    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE" || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
+    chmod 600 "$PORT_INFO_FILE" || return 1
     log_info "保存端口 $port 配置"
 }
 
 # 删除端口信息
 delete_port_info() {
     local port=$1
-    jq --argjson port "$port" 'del(.ports[] | select(.port == $port))' "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"
-    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
-    chmod 600 "$PORT_INFO_FILE"
+    if ! jq --argjson port "$port" 'del(.ports[] | select(.port == $port))' \
+        "$PORT_INFO_FILE" > "${PORT_INFO_FILE}.tmp"; then
+        rm -f "${PORT_INFO_FILE}.tmp"
+        return 1
+    fi
+    jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || {
+        rm -f "${PORT_INFO_FILE}.tmp"
+        return 1
+    }
+    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE" || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
+    chmod 600 "$PORT_INFO_FILE" || return 1
     log_info "删除端口 $port 配置"
 }
 
@@ -417,8 +448,8 @@ set_port_socks5_config() {
         return 1
     fi
     jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
-    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
-    chmod 600 "$PORT_INFO_FILE"
+    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE" || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
+    chmod 600 "$PORT_INFO_FILE" || return 1
     log_info "设置端口 $port 的SOCKS5配置"
 }
 
@@ -433,6 +464,10 @@ set_port_haproxy_config() {
                 echo -e "${RED}HAProxy端口、线程数或最大连接数无效${NONE}"
                 return 1
             }
+        if ! validate_haproxy_port_available "$port" "$haproxy_port"; then
+            echo -e "${RED}HAProxy端口 $haproxy_port 已被占用或与其他配置冲突${NONE}"
+            return 1
+        fi
         haproxy_config=$(jq -n --argjson port "$haproxy_port" --argjson threads "$threads" \
             --argjson maxconn "$maxconn" \
             '{enabled: true, port: $port, threads: $threads, maxconn: $maxconn}') || return 1
@@ -447,51 +482,165 @@ set_port_haproxy_config() {
         return 1
     fi
     jq -e . "${PORT_INFO_FILE}.tmp" >/dev/null || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
-    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE"
-    chmod 600 "$PORT_INFO_FILE"
+    mv "${PORT_INFO_FILE}.tmp" "$PORT_INFO_FILE" || { rm -f "${PORT_INFO_FILE}.tmp"; return 1; }
+    chmod 600 "$PORT_INFO_FILE" || return 1
     log_info "设置端口 $port 的HAProxy配置"
-}
-
-# 保留端口的代理配置（用于修改UUID/域名/ShortID时）
-preserve_port_proxy_config() {
-    local port=$1
-    local port_info=$(get_port_info "$port")
-
-    # 保留SOCKS5配置
-    local socks5_config=$(echo "$port_info" | jq -r '.socks5')
-    if [[ "$socks5_config" != "null" ]]; then
-        local enabled=$(echo "$socks5_config" | jq -r '.enabled // false')
-        if [[ "$enabled" == "true" ]]; then
-            local addr=$(echo "$socks5_config" | jq -r '.address')
-            local sport=$(echo "$socks5_config" | jq -r '.port')
-            local auth=$(echo "$socks5_config" | jq -r '.auth_needed')
-            local user=$(echo "$socks5_config" | jq -r '.username')
-            local pass=$(echo "$socks5_config" | jq -r '.password')
-            local udp=$(echo "$socks5_config" | jq -r '.udp_over_tcp')
-
-            set_port_socks5_config "$port" "y" "$addr" "$sport" \
-                "$([ "$auth" == "true" ] && echo y || echo n)" "$user" "$pass" \
-                "$([ "$udp" == "true" ] && echo y || echo n)"
-        fi
-    fi
-
-    # 保留HAProxy配置
-    local haproxy_config=$(echo "$port_info" | jq -r '.haproxy')
-    if [[ "$haproxy_config" != "null" ]]; then
-        local enabled=$(echo "$haproxy_config" | jq -r '.enabled // false')
-        if [[ "$enabled" == "true" ]]; then
-            local hport=$(echo "$haproxy_config" | jq -r '.port')
-            local threads=$(echo "$haproxy_config" | jq -r '.threads')
-            local maxconn=$(echo "$haproxy_config" | jq -r '.maxconn')
-            set_port_haproxy_config "$port" "y" "$hport" "$threads" "$maxconn"
-        fi
-    fi
 }
 
 # ============================================================
 # 第六部分：配置文件操作
 # ============================================================
 
+# 配置事务：端口状态、Xray配置和HAProxy配置必须作为一个整体提交。
+# 任一步骤失败时恢复三者，避免“列表已变但实际服务仍是旧配置”。
+CONFIG_TXN_DIR=""
+
+begin_config_transaction() {
+    [[ -z "$CONFIG_TXN_DIR" ]] || return 1
+    CONFIG_TXN_DIR=$(mktemp -d) || return 1
+
+    if [[ -f "$PORT_INFO_FILE" ]]; then
+        cp -a "$PORT_INFO_FILE" "$CONFIG_TXN_DIR/port-info" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    else
+        : > "$CONFIG_TXN_DIR/port-info.absent" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    fi
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp -a "$CONFIG_FILE" "$CONFIG_TXN_DIR/xray-config" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    else
+        : > "$CONFIG_TXN_DIR/xray-config.absent" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    fi
+    if [[ -f "$HAPROXY_CONFIG" ]]; then
+        cp -a "$HAPROXY_CONFIG" "$CONFIG_TXN_DIR/haproxy-config" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    else
+        : > "$CONFIG_TXN_DIR/haproxy-config.absent" || {
+            rm -rf "$CONFIG_TXN_DIR"; CONFIG_TXN_DIR=""; return 1;
+        }
+    fi
+}
+
+rollback_config_transaction() {
+    [[ -n "$CONFIG_TXN_DIR" && -d "$CONFIG_TXN_DIR" ]] || return 0
+
+    if [[ -f "$CONFIG_TXN_DIR/port-info" ]]; then
+        cp -a "$CONFIG_TXN_DIR/port-info" "$PORT_INFO_FILE" || return 1
+    elif [[ -f "$CONFIG_TXN_DIR/port-info.absent" ]]; then
+        rm -f "$PORT_INFO_FILE" || return 1
+    else
+        return 1
+    fi
+    if [[ -f "$CONFIG_TXN_DIR/xray-config" ]]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")" && cp -a "$CONFIG_TXN_DIR/xray-config" "$CONFIG_FILE" || return 1
+    elif [[ -f "$CONFIG_TXN_DIR/xray-config.absent" ]]; then
+        rm -f "$CONFIG_FILE" || return 1
+    else
+        return 1
+    fi
+    if [[ -f "$CONFIG_TXN_DIR/haproxy-config" ]]; then
+        mkdir -p "$(dirname "$HAPROXY_CONFIG")" && cp -a "$CONFIG_TXN_DIR/haproxy-config" "$HAPROXY_CONFIG" || return 1
+    elif [[ -f "$CONFIG_TXN_DIR/haproxy-config.absent" ]]; then
+        rm -f "$HAPROXY_CONFIG" || return 1
+    else
+        return 1
+    fi
+
+    rm -rf "$CONFIG_TXN_DIR"
+    CONFIG_TXN_DIR=""
+}
+
+commit_config_transaction() {
+    if [[ -n "$CONFIG_TXN_DIR" ]]; then
+        rm -rf "$CONFIG_TXN_DIR" || return 1
+    fi
+    CONFIG_TXN_DIR=""
+}
+
+rollback_or_report() {
+    if ! rollback_config_transaction; then
+        echo -e "${RED}严重错误: 配置回滚未完整完成，请勿重启服务，并检查事务目录: ${CONFIG_TXN_DIR}${NONE}" >&2
+        log_error "配置事务回滚失败: $CONFIG_TXN_DIR"
+        return 1
+    fi
+    return 0
+}
+
+apply_configuration_changes() {
+    local update_haproxy=${1:-y}
+    local manage_haproxy=n haproxy_action=none haproxy_count=0
+    haproxy_count=$(jq '[.ports[] | select(.haproxy != null and .haproxy.enabled == true)] | length' "$PORT_INFO_FILE") || {
+        rollback_or_report || return 1
+        return 1
+    }
+
+    if [[ "$update_haproxy" == "y" ]]; then
+        if [[ "$haproxy_count" -gt 0 ]]; then
+            if ! command -v haproxy >/dev/null 2>&1; then
+                echo -e "${RED}状态中存在HAProxy监听，但系统未安装HAProxy${NONE}" >&2
+                rollback_or_report || return 1
+                return 1
+            fi
+            manage_haproxy=y
+            haproxy_action=restart
+            if ! update_haproxy_config; then
+                rollback_or_report || return 1
+                return 1
+            fi
+        elif command -v haproxy >/dev/null 2>&1 || [[ -f "$HAPROXY_CONFIG" ]] || systemctl is-active --quiet haproxy 2>/dev/null; then
+            # HAProxy无监听配置会以退出码2拒绝启动，因此最后一个监听禁用时直接停止服务。
+            manage_haproxy=y
+            haproxy_action=stop
+        fi
+    fi
+
+    if ! update_config_file; then
+        rollback_or_report || return 1
+        return 1
+    fi
+
+    if [[ "$haproxy_action" == "restart" ]]; then
+        if ! restart_haproxy; then
+            rollback_or_report || return 1
+            restart_haproxy >/dev/null 2>&1 || true
+            restart_xray >/dev/null 2>&1 || true
+            return 1
+        fi
+    elif [[ "$haproxy_action" == "stop" ]]; then
+        if ! stop_haproxy; then
+            rollback_or_report || return 1
+            restart_haproxy >/dev/null 2>&1 || true
+            restart_xray >/dev/null 2>&1 || true
+            return 1
+        fi
+        # 无监听时磁盘配置也必须与状态一致。旧配置由事务快照保存，
+        # 若后续Xray重启失败，rollback会恢复它并重新启动原服务。
+        if ! rm -f "$HAPROXY_CONFIG"; then
+            rollback_or_report || return 1
+            restart_haproxy >/dev/null 2>&1 || true
+            restart_xray >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+
+    if ! restart_xray; then
+        rollback_or_report || return 1
+        if [[ "$manage_haproxy" == "y" ]]; then
+            restart_haproxy >/dev/null 2>&1 || true
+        fi
+        restart_xray >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    commit_config_transaction
+}
 # 构建VLESS入站配置
 build_inbound_config() {
     local port=$1 uuid=$2 private_key=$3 shortid=$4 domain=$5
@@ -568,6 +717,11 @@ update_config_file() {
 }
 EOL
 
+    jq -e '.ports | type == "array"' "$PORT_INFO_FILE" >/dev/null || {
+        rm -f "$temp_config"
+        return 1
+    }
+
     # 处理每个端口配置
     while read -r port_info; do
         [[ -z "$port_info" ]] && continue
@@ -580,8 +734,12 @@ EOL
 
         # 添加入站配置
         local inbound=$(build_inbound_config "$port" "$uuid" "$private_key" "$shortid" "$domain")
-        jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$temp_config" > "${temp_config}.new"
-        mv "${temp_config}.new" "$temp_config"
+        if [[ -z "$inbound" ]] || ! jq --argjson inbound "$inbound" '.inbounds += [$inbound]' \
+            "$temp_config" > "${temp_config}.new"; then
+            rm -f "$temp_config" "${temp_config}.new"
+            return 1
+        fi
+        mv "${temp_config}.new" "$temp_config" || { rm -f "$temp_config" "${temp_config}.new"; return 1; }
 
         # 处理SOCKS5配置
         local socks5_config=$(echo "$port_info" | jq -r '.socks5')
@@ -605,18 +763,25 @@ EOL
             # 添加SOCKS5出站
             local socks5_outbound=$(build_socks5_outbound "$port" "$socks5_address" "$socks5_port" \
                 "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp")
-            jq --argjson outbound "$socks5_outbound" '.outbounds += [$outbound]' "$temp_config" > "${temp_config}.new"
-            mv "${temp_config}.new" "$temp_config"
+            if [[ -z "$socks5_outbound" ]] || ! jq --argjson outbound "$socks5_outbound" '.outbounds += [$outbound]' \
+                "$temp_config" > "${temp_config}.new"; then
+                rm -f "$temp_config" "${temp_config}.new"
+                return 1
+            fi
+            mv "${temp_config}.new" "$temp_config" || { rm -f "$temp_config" "${temp_config}.new"; return 1; }
 
             # 添加路由规则
-            jq --arg port "$port" '.routing.rules += [{
+            if ! jq --arg port "$port" '.routing.rules += [{
                 type: "field",
                 inboundTag: [("inbound-" + $port)],
                 outboundTag: ("socks5-out-" + $port)
-            }]' "$temp_config" > "${temp_config}.new"
-            mv "${temp_config}.new" "$temp_config"
+            }]' "$temp_config" > "${temp_config}.new"; then
+                rm -f "$temp_config" "${temp_config}.new"
+                return 1
+            fi
+            mv "${temp_config}.new" "$temp_config" || { rm -f "$temp_config" "${temp_config}.new"; return 1; }
         fi
-    done < <(jq -c '.ports[]' "$PORT_INFO_FILE")
+    done < <(jq -e -c '.ports[]' "$PORT_INFO_FILE")
 
     if ! jq -e . "$temp_config" >/dev/null; then
         echo -e "${RED}生成的Xray配置不是有效JSON，已保留原配置${NONE}"
@@ -632,9 +797,9 @@ EOL
         return 1
     fi
 
-    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    chmod 644 "$temp_config"
-    mv -f "$temp_config" "$CONFIG_FILE"
+    [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S%N)" || true
+    chmod 644 "$temp_config" || { rm -f "$temp_config"; return 1; }
+    mv -f "$temp_config" "$CONFIG_FILE" || { rm -f "$temp_config"; return 1; }
     rm -f "${temp_config}.new"
     log_info "配置文件已更新"
 }
@@ -708,10 +873,10 @@ EOL
         return 1
     fi
 
-    [[ -f "$HAPROXY_CONFIG" ]] && cp "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    chmod 644 "$temp_haproxy"
-    mv -f "$temp_haproxy" "$HAPROXY_CONFIG"
-    restart_haproxy
+    [[ -f "$HAPROXY_CONFIG" ]] && cp "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.$(date +%Y%m%d%H%M%S%N)" || true
+    chmod 644 "$temp_haproxy" || { rm -f "$temp_haproxy"; return 1; }
+    mv -f "$temp_haproxy" "$HAPROXY_CONFIG" || { rm -f "$temp_haproxy"; return 1; }
+    log_info "HAProxy配置文件已更新"
 }
 
 # ============================================================
@@ -756,6 +921,34 @@ restart_xray() {
     fi
 }
 
+# 停止HAProxy服务（用于禁用最后一个监听）
+stop_haproxy() {
+    systemctl stop haproxy 2>/dev/null || true
+    if systemctl is-active --quiet haproxy; then
+        echo -e "${RED}HAProxy停止失败${NONE}"
+        return 1
+    fi
+    echo -e "${GREEN}HAProxy已停止（当前无启用的代理监听）${NONE}"
+    log_info "HAProxy服务已停止"
+    return 0
+}
+
+# 服务已停止后归档活动配置。先完成全部复制，再删除活动文件；任何一步失败
+# 都返回非零，由外层配置事务恢复状态及配置，避免只移动成功其中一个文件。
+archive_inactive_config_files() {
+    local suffix
+    suffix=$(date +%Y%m%d%H%M%S%N) || return 1
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp -a "$CONFIG_FILE" "${CONFIG_FILE}.bak.${suffix}" || return 1
+    fi
+    if [[ -f "$HAPROXY_CONFIG" ]]; then
+        cp -a "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.${suffix}" || return 1
+    fi
+
+    rm -f "$CONFIG_FILE" "$HAPROXY_CONFIG" || return 1
+}
+
 # 重启HAProxy服务
 restart_haproxy() {
     if systemctl is-active --quiet haproxy; then
@@ -768,9 +961,11 @@ restart_haproxy() {
     if systemctl is-active --quiet haproxy; then
         echo -e "${GREEN}HAProxy重启成功${NONE}"
         log_info "HAProxy服务重启成功"
+        return 0
     else
         echo -e "${RED}HAProxy服务启动失败，请检查配置${NONE}"
         log_error "HAProxy服务启动失败"
+        return 1
     fi
 }
 
@@ -816,12 +1011,16 @@ generate_keys() {
 # 查找可用端口
 find_available_port() {
     local start_port=$1
+    local owner_port=${2:-0}
     local port=$start_port
-    while lsof -i:"$port" >/dev/null 2>&1 || check_port_exists "$port"; do
+    while validate_port "$port"; do
+        if ! lsof -i:"$port" >/dev/null 2>&1 && ! check_managed_port_exists "$port" "$owner_port" && [[ "$port" != "$owner_port" ]]; then
+            echo "$port"
+            return 0
+        fi
         port=$((port + 1))
     done
-    validate_port "$port" || return 1
-    echo "$port"
+    return 1
 }
 
 # 配置SOCKS5代理
@@ -916,16 +1115,15 @@ configure_socks5() {
         haproxy_threads=$(echo "$current_haproxy" | jq -r '.threads // 12')
         haproxy_maxconn=$(echo "$current_haproxy" | jq -r '.maxconn // 400')
     else
-        haproxy_port=$(find_available_port $((port + 10))) || {
+        haproxy_port=$(find_available_port $((port + 10)) "$port") || {
             echo -e "${RED}未找到可用的HAProxy端口${NONE}"
             return 1
         }
     fi
 
     set_port_haproxy_config "$port" "y" "$haproxy_port" "$haproxy_threads" "$haproxy_maxconn" || return 1
-    update_haproxy_config || return 1
 
-    echo -e "${GREEN}SOCKS5和HAProxy配置完成，HAProxy端口: $haproxy_port${NONE}"
+    echo -e "${GREEN}SOCKS5和HAProxy配置已暂存, HAProxy端口: $haproxy_port${NONE}"
     log_info "为端口 $port 配置SOCKS5代理"
 }
 
@@ -957,8 +1155,8 @@ add_port_configuration() {
         if ! validate_port "$port"; then
             msg_error; continue
         fi
-        if check_port_exists "$port"; then
-            echo -e "${RED}端口 $port 已被配置${NONE}"; continue
+        if check_managed_port_exists "$port"; then
+            echo -e "${RED}端口 $port 已被VLESS或HAProxy配置占用${NONE}"; continue
         fi
         if lsof -i:"$port" >/dev/null 2>&1; then
             echo -e "${RED}端口 $port 已被占用${NONE}"; continue
@@ -1019,20 +1217,26 @@ add_port_configuration() {
     echo -e "${YELLOW}SNI = ${CYAN}${domain}${NONE}"
     print_line
 
-    # 保存配置
-    save_port_info "$port" "$uuid" "$private_key" "$public_key" "$shortid" "$domain"
+    # 从保存状态开始进入事务；配置生成或服务重启失败时恢复原状态
+    begin_config_transaction || return 1
+    save_port_info "$port" "$uuid" "$private_key" "$public_key" "$shortid" "$domain" || {
+        rollback_or_report || return 1
+        return 1
+    }
 
     # SOCKS5配置
     if read_yes_no "是否配置SOCKS5转发代理?" "n"; then
-        configure_socks5 "$port"
+        configure_socks5 "$port" || {
+            rollback_or_report || return 1
+            return 1
+        }
     fi
 
-    # 更新配置并重启
-    if ! update_config_file; then
-        echo -e "${RED}配置生成或验证失败，未重启Xray${NONE}"
+    # 统一生成配置并重启，任何失败都回滚事务
+    if ! apply_configuration_changes y; then
+        echo -e "${RED}配置应用失败，已恢复修改前状态${NONE}"
         return 1
     fi
-    restart_xray
 
     # 生成连接信息
     generate_connection_info "$port" "$uuid" "$public_key" "$shortid" "$domain" "$SELECTED_IP" "$SELECTED_NETSTACK"
@@ -1066,6 +1270,7 @@ modify_port_configuration() {
 
     local port=$(jq -r ".ports[$((port_index-1))].port" "$PORT_INFO_FILE")
     local original_md5=$(jq -c '.ports' "$PORT_INFO_FILE" | md5sum | cut -d ' ' -f1)
+    begin_config_transaction || return 1
 
     # 获取当前IP
     get_local_ips
@@ -1085,24 +1290,23 @@ modify_port_configuration() {
     read -p "$(echo -e "请选择 [${GREEN}0-5${NONE}]: ")" choice
 
     case $choice in
-        1) modify_port_uuid "$port" || return 1 ;;
-        2) modify_port_domain "$port" || return 1 ;;
-        3) modify_port_shortid "$port" || return 1 ;;
-        4) modify_port_socks5 "$port" || return 1 ;;
-        5) modify_port_haproxy "$port" || return 1 ;;
-        0) return ;;
-        *) msg_error; return ;;
+        1) modify_port_uuid "$port" || { rollback_or_report || return 1; return 1; } ;;
+        2) modify_port_domain "$port" || { rollback_or_report || return 1; return 1; } ;;
+        3) modify_port_shortid "$port" || { rollback_or_report || return 1; return 1; } ;;
+        4) modify_port_socks5 "$port" || { rollback_or_report || return 1; return 1; } ;;
+        5) modify_port_haproxy "$port" || { rollback_or_report || return 1; return 1; } ;;
+        0) commit_config_transaction; return ;;
+        *) msg_error; rollback_or_report || return 1; return 1 ;;
     esac
 
     # 检查是否有变更
     local new_md5=$(jq -c '.ports' "$PORT_INFO_FILE" | md5sum | cut -d ' ' -f1)
     if [[ "$original_md5" != "$new_md5" ]]; then
         msg_info "配置已更改，更新Xray配置..."
-        if ! update_config_file; then
-            echo -e "${RED}配置验证失败，未重启Xray${NONE}"
+        if ! apply_configuration_changes y; then
+            echo -e "${RED}配置应用失败，已恢复修改前状态${NONE}"
             return 1
         fi
-        restart_xray || return 1
 
         local port_info=$(get_port_info "$port")
         generate_connection_info "$port" \
@@ -1111,6 +1315,8 @@ modify_port_configuration() {
             "$(echo "$port_info" | jq -r '.shortid')" \
             "$(echo "$port_info" | jq -r '.domain')" \
             "$current_ip" "$current_netstack"
+    else
+        commit_config_transaction
     fi
 
     pause
@@ -1124,16 +1330,21 @@ modify_port_uuid() {
 
     echo -e "当前UUID: ${CYAN}$old_uuid${NONE}"
 
-    local default_uuid=$(generate_default_uuid "$IPv4" "$port")
     local new_uuid
     while :; do
-        read -p "$(echo -e "请输入新UUID (默认: ${CYAN}${default_uuid}${NONE}): ")" new_uuid
-        [[ -z "$new_uuid" ]] && new_uuid=$default_uuid
+        read -r -p "$(echo -e "请输入新UUID (当前: ${CYAN}${old_uuid}${NONE}，回车保留): ")" new_uuid
+        [[ -z "$new_uuid" ]] && new_uuid=$old_uuid
         if ! validate_uuid "$new_uuid"; then
             msg_error; continue
         fi
         break
     done
+
+    # UUID没有变化时不重新生成密钥
+    if [[ "$new_uuid" == "$old_uuid" ]]; then
+        echo -e "${YELLOW}UUID未修改${NONE}"
+        return 0
+    fi
 
     local tmp_key new_private_key new_public_key
     tmp_key=$(generate_keys "$new_uuid")
@@ -1146,8 +1357,7 @@ modify_port_uuid() {
     local new_shortid=$(echo -n "${new_uuid}" | sha1sum | head -c 16)
     local domain=$(echo "$port_info" | jq -r '.domain')
 
-    save_port_info "$port" "$new_uuid" "$new_private_key" "$new_public_key" "$new_shortid" "$domain"
-    preserve_port_proxy_config "$port"
+    save_port_info "$port" "$new_uuid" "$new_private_key" "$new_public_key" "$new_shortid" "$domain" || return 1
 
     msg_success "UUID修改成功!"
     log_info "修改端口 $port 的UUID: $old_uuid -> $new_uuid"
@@ -1162,8 +1372,8 @@ modify_port_domain() {
     echo -e "当前域名: ${CYAN}$old_domain${NONE}"
 
     while :; do
-        read -r -p "$(echo -e "请输入新域名 (默认: ${CYAN}learn.microsoft.com${NONE}): ")" new_domain
-        [[ -z "$new_domain" ]] && new_domain="learn.microsoft.com"
+        read -r -p "$(echo -e "请输入新域名 (当前: ${CYAN}${old_domain}${NONE}，回车保留): ")" new_domain
+        [[ -z "$new_domain" ]] && new_domain=$old_domain
         validate_domain "$new_domain" && break
         echo -e "${RED}域名格式无效${NONE}"
     done
@@ -1173,8 +1383,7 @@ modify_port_domain() {
         "$(echo "$port_info" | jq -r '.private_key')" \
         "$(echo "$port_info" | jq -r '.public_key')" \
         "$(echo "$port_info" | jq -r '.shortid')" \
-        "$new_domain"
-    preserve_port_proxy_config "$port"
+        "$new_domain" || return 1
 
     msg_success "域名修改成功!"
     log_info "修改端口 $port 的域名: $old_domain -> $new_domain"
@@ -1189,11 +1398,10 @@ modify_port_shortid() {
 
     echo -e "当前ShortID: ${CYAN}$old_shortid${NONE}"
 
-    local default_shortid=$(echo -n "${uuid}" | sha1sum | head -c 16)
     local new_shortid
     while :; do
-        read -p "$(echo -e "请输入新ShortID (默认: ${CYAN}${default_shortid}${NONE}): ")" new_shortid
-        [[ -z "$new_shortid" ]] && new_shortid=$default_shortid
+        read -r -p "$(echo -e "请输入新ShortID (当前: ${CYAN}${old_shortid}${NONE}，回车保留): ")" new_shortid
+        [[ -z "$new_shortid" ]] && new_shortid=$old_shortid
         if ! validate_shortid "$new_shortid"; then
             msg_error; continue
         fi
@@ -1204,8 +1412,7 @@ modify_port_shortid() {
         "$(echo "$port_info" | jq -r '.private_key')" \
         "$(echo "$port_info" | jq -r '.public_key')" \
         "$new_shortid" \
-        "$(echo "$port_info" | jq -r '.domain')"
-    preserve_port_proxy_config "$port"
+        "$(echo "$port_info" | jq -r '.domain')" || return 1
 
     msg_success "ShortID修改成功!"
     log_info "修改端口 $port 的ShortID: $old_shortid -> $new_shortid"
@@ -1224,9 +1431,8 @@ modify_port_socks5() {
         echo -e "SOCKS5服务器: ${CYAN}$addr:$sport${NONE}"
 
         if read_yes_no "是否禁用SOCKS5代理?" "n"; then
-            set_port_socks5_config "$port" "n" "" "" "" "" "" ""
-            set_port_haproxy_config "$port" "n" 1 1 1
-            update_haproxy_config
+            set_port_socks5_config "$port" "n" "" "" "" "" "" "" || return 1
+            set_port_haproxy_config "$port" "n" 1 1 1 || return 1
             msg_success "SOCKS5代理已禁用!"
         else
             configure_socks5 "$port" || return 1
@@ -1238,7 +1444,6 @@ modify_port_socks5() {
         fi
     fi
 
-    update_config_file || return 1
 }
 
 # 修改HAProxy设置
@@ -1274,14 +1479,13 @@ modify_port_haproxy() {
             read -p "$(echo -e "新最大连接数 (当前: ${CYAN}$maxconn${NONE}): ")" new_maxconn
             [[ -z "$new_maxconn" ]] && new_maxconn=$maxconn
 
-            set_port_haproxy_config "$port" "y" "$new_port" "$new_threads" "$new_maxconn"
-            update_haproxy_config
-            msg_success "HAProxy配置已更新!"
+            set_port_haproxy_config "$port" "y" "$new_port" "$new_threads" "$new_maxconn" || return 1
+            msg_success "HAProxy配置已暂存!"
         fi
     else
         echo -e "当前状态: ${RED}未启用${NONE}"
         if read_yes_no "是否启用HAProxy?" "n"; then
-            local haproxy_port=$(find_available_port $((port + 1)))
+            local haproxy_port=$(find_available_port $((port + 10)) "$port")
             read -p "$(echo -e "HAProxy端口 (默认: ${CYAN}$haproxy_port${NONE}): ")" hport
             [[ -z "$hport" ]] && hport=$haproxy_port
             read -p "$(echo -e "线程数 (默认: ${CYAN}12${NONE}): ")" threads
@@ -1289,9 +1493,8 @@ modify_port_haproxy() {
             read -p "$(echo -e "最大连接数 (默认: ${CYAN}400${NONE}): ")" maxconn
             [[ -z "$maxconn" ]] && maxconn=400
 
-            set_port_haproxy_config "$port" "y" "$hport" "$threads" "$maxconn"
-            update_haproxy_config
-            msg_success "HAProxy已启用!"
+            set_port_haproxy_config "$port" "y" "$hport" "$threads" "$maxconn" || return 1
+            msg_success "HAProxy配置已暂存!"
         fi
     fi
 }
@@ -1324,20 +1527,39 @@ delete_port_configuration() {
     local port=$(jq -r ".ports[$((port_index-1))].port" "$PORT_INFO_FILE")
 
     if read_yes_no "确认删除端口 $port 的配置?" "n"; then
-        delete_port_info "$port"
-        rm -f "$HOME/vless_reality_${port}.txt"
+        begin_config_transaction || return 1
+        delete_port_info "$port" || {
+            rollback_or_report || return 1
+            return 1
+        }
 
         if [[ $(get_port_count) -eq 0 ]]; then
             msg_info "已删除所有端口配置，停止服务"
-            systemctl stop haproxy xray 2>/dev/null
-            [[ -f "$CONFIG_FILE" ]] && mv "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-            [[ -f "$HAPROXY_CONFIG" ]] && mv "$HAPROXY_CONFIG" "${HAPROXY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-        else
-            update_config_file
-            update_haproxy_config
-            restart_xray
+            systemctl stop haproxy xray 2>/dev/null || true
+            if systemctl is-active --quiet haproxy || systemctl is-active --quiet xray; then
+                rollback_or_report || return 1
+                restart_haproxy >/dev/null 2>&1 || true
+                restart_xray >/dev/null 2>&1 || true
+                echo -e "${RED}停止服务失败，已恢复删除前状态${NONE}"
+                return 1
+            fi
+            if ! archive_inactive_config_files; then
+                rollback_or_report || return 1
+                restart_haproxy >/dev/null 2>&1 || true
+                restart_xray >/dev/null 2>&1 || true
+                echo -e "${RED}归档配置失败，已恢复删除前状态${NONE}"
+                return 1
+            fi
+            if ! commit_config_transaction; then
+                echo -e "${RED}配置已删除，但清理事务快照失败，请检查: ${CONFIG_TXN_DIR}${NONE}" >&2
+                return 1
+            fi
+        elif ! apply_configuration_changes y; then
+            echo -e "${RED}删除配置应用失败，已恢复删除前状态${NONE}"
+            return 1
         fi
 
+        rm -f "$HOME/vless_reality_${port}.txt"
         msg_success "端口 $port 配置已删除!"
     fi
 
@@ -1540,18 +1762,40 @@ restore_configuration() {
         return
     fi
 
-    local port_info_file=$(find "$temp_dir" -name ".xray_port_info.json" | head -n 1)
-    local xray_config=$(find "$temp_dir" -name "config.json" | head -n 1)
-    local haproxy_cfg=$(find "$temp_dir" -name "haproxy.cfg" | head -n 1)
+    local port_info_file xray_config haproxy_cfg
+    port_info_file=$(find "$temp_dir" -name ".xray_port_info.json" -print -quit)
+    xray_config=$(find "$temp_dir" -name "config.json" -print -quit)
+    haproxy_cfg=$(find "$temp_dir" -name "haproxy.cfg" -print -quit)
 
-    [[ -n "$port_info_file" ]] && cp "$port_info_file" "$PORT_INFO_FILE" && chmod 600 "$PORT_INFO_FILE"
-    [[ -n "$xray_config" ]] && mkdir -p "$CONFIG_DIR" && cp "$xray_config" "$CONFIG_FILE"
-    [[ -n "$haproxy_cfg" ]] && mkdir -p /etc/haproxy && cp "$haproxy_cfg" "$HAPROXY_CONFIG"
+    if [[ -z "$port_info_file" ]] || ! jq -e '.ports | type == "array"' "$port_info_file" >/dev/null; then
+        echo -e "${RED}备份中的端口状态文件缺失或无效${NONE}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    if [[ -n "$xray_config" ]] && command -v xray >/dev/null 2>&1 && ! xray run -test -config "$xray_config" >/dev/null 2>&1; then
+        echo -e "${RED}备份中的Xray配置验证失败${NONE}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    if [[ -n "$haproxy_cfg" ]] && command -v haproxy >/dev/null 2>&1 && ! haproxy -c -f "$haproxy_cfg" >/dev/null 2>&1; then
+        echo -e "${RED}备份中的HAProxy配置验证失败${NONE}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # 端口状态是管理器的唯一数据源。恢复后统一从状态重新生成并验证
+    # Xray/HAProxy配置，避免不完整备份造成状态与运行配置分裂。
+    begin_config_transaction || { rm -rf "$temp_dir"; return 1; }
+    cp "$port_info_file" "$PORT_INFO_FILE" && chmod 600 "$PORT_INFO_FILE" || {
+        rollback_or_report || { rm -rf "$temp_dir"; return 1; }; rm -rf "$temp_dir"; return 1;
+    }
 
     rm -rf "$temp_dir"
 
-    [[ -n "$haproxy_cfg" ]] && restart_haproxy
-    [[ -n "$xray_config" ]] && restart_xray
+    if ! apply_configuration_changes y; then
+        echo -e "${RED}恢复配置应用失败，已尝试恢复恢复前状态${NONE}"
+        return 1
+    fi
 
     msg_success "配置恢复完成!"
     pause
@@ -1708,6 +1952,17 @@ sync_config_from_xray() {
         echo -e "${RED}Xray配置文件不存在${NONE}"
         return 1
     fi
+    # 必须先完整解析源配置。不能通过进程替换逐条读取，否则jq中途报错时
+    # while仍可能返回成功并提交已经解析出的部分状态。
+    if ! jq -e '
+        type == "object" and
+        (.inbounds | type == "array") and
+        ((.outbounds // []) | type == "array") and
+        ((.routing.rules // []) | type == "array")
+    ' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}Xray配置不是完整有效的JSON，拒绝同步${NONE}"
+        return 1
+    fi
 
     echo -e "${YELLOW}此功能将从现有Xray配置中提取端口信息${NONE}"
     echo -e "${YELLOW}适用于 .xray_port_info.json 丢失或损坏的情况${NONE}"
@@ -1738,9 +1993,14 @@ sync_config_from_xray() {
         done < "$HAPROXY_CONFIG"
     fi
 
+    # 同步也是配置事务：解析或应用失败时恢复同步前状态
+    begin_config_transaction || return 1
+
     # 重置端口信息文件
-    echo '{"ports":[]}' > "$PORT_INFO_FILE"
-    chmod 600 "$PORT_INFO_FILE"
+    if ! echo '{"ports":[]}' > "$PORT_INFO_FILE" || ! chmod 600 "$PORT_INFO_FILE"; then
+        rollback_or_report || return 1
+        return 1
+    fi
 
     # 解析Xray配置中的inbound
     msg_info "解析Xray配置..."
@@ -1775,7 +2035,10 @@ sync_config_from_xray() {
         echo -e "${CYAN}发现端口 $port: UUID=${uuid:0:8}..., 域名=$domain${NONE}"
 
         # 保存基本信息
-        save_port_info "$port" "$uuid" "$private_key" "$public_key" "$shortid" "$domain"
+        if ! save_port_info "$port" "$uuid" "$private_key" "$public_key" "$shortid" "$domain"; then
+            rollback_or_report || return 1
+            return 1
+        fi
 
         # 查找关联的SOCKS5出站
         local socks5_tag=""
@@ -1829,19 +2092,19 @@ sync_config_from_xray() {
                         socks5_port="$hp_sport"
 
                         # 设置SOCKS5和HAProxy配置
-                        set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp"
-                        set_port_haproxy_config "$port" "y" "$hp_port" 12 400
+                        set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp" || { rollback_or_report || return 1; return 1; }
+                        set_port_haproxy_config "$port" "y" "$hp_port" 12 400 || { rollback_or_report || return 1; return 1; }
                     else
                         echo -e "${RED}警告: 端口 $port 的SOCKS5使用本地地址但未找到HAProxy配置${NONE}"
-                        set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp"
+                        set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp" || { rollback_or_report || return 1; return 1; }
                     fi
                 else
                     # 非本地地址，检查是否有HAProxy配置
-                    set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp"
+                    set_port_socks5_config "$port" "y" "$socks5_addr" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp" || { rollback_or_report || return 1; return 1; }
 
                     if [[ -n "${haproxy_map[$port]}" ]]; then
                         IFS=':' read -r hp_port _ _ <<< "${haproxy_map[$port]}"
-                        set_port_haproxy_config "$port" "y" "$hp_port" 12 400
+                        set_port_haproxy_config "$port" "y" "$hp_port" 12 400 || { rollback_or_report || return 1; return 1; }
                     fi
                 fi
 
@@ -1854,25 +2117,19 @@ sync_config_from_xray() {
 
     if [[ $inbound_count -eq 0 ]]; then
         echo -e "${RED}未在Xray配置中找到VLESS+Reality端口${NONE}"
+        rollback_or_report || return 1
         return 1
     fi
 
     echo
     echo -e "${GREEN}成功同步 $inbound_count 个端口配置${NONE}"
 
-    # 重新生成配置文件确保一致性
-    msg_info "重新生成配置文件..."
-    update_config_file
-
-    # 更新HAProxy配置
-    local haproxy_count=$(jq '[.ports[] | select(.haproxy != null and .haproxy.enabled == true)] | length' "$PORT_INFO_FILE")
-    if [[ $haproxy_count -gt 0 ]]; then
-        msg_info "更新HAProxy配置..."
-        update_haproxy_config
+    # 统一生成、验证、重启；失败时恢复同步前状态
+    msg_info "重新生成并应用配置文件..."
+    if ! apply_configuration_changes y; then
+        echo -e "${RED}配置同步应用失败，已尝试恢复同步前状态${NONE}"
+        return 1
     fi
-
-    # 重启服务
-    restart_xray
 
     msg_success "配置同步完成!"
     list_port_configurations
@@ -1933,6 +2190,27 @@ show_menu() {
 
 main() {
     check_root
+    # flock命令由Debian/Ubuntu的util-linux包提供，不能尝试安装名为flock的包。
+    # 锁必须在任何配置初始化前获取，因此先单独引导该依赖。
+    if ! command -v flock >/dev/null 2>&1; then
+        msg_info "正在安装进程锁依赖: util-linux"
+        if ! apt update -y || ! apt install -y util-linux || ! command -v flock >/dev/null 2>&1; then
+            echo -e "${RED}安装flock依赖失败，请手动安装util-linux${NONE}" >&2
+            exit 1
+        fi
+    fi
+    mkdir -p "$(dirname "$LOCK_FILE")" || {
+        echo -e "${RED}无法创建锁文件目录${NONE}" >&2
+        exit 1
+    }
+    exec 9>"$LOCK_FILE" || {
+        echo -e "${RED}无法打开管理器锁文件: $LOCK_FILE${NONE}" >&2
+        exit 1
+    }
+    if ! flock -n 9; then
+        echo -e "${RED}已有另一个Xray管理器实例正在运行，请稍后重试${NONE}" >&2
+        exit 1
+    fi
     init_directories
     check_dependencies || exit 1
     log_info "脚本启动，版本 $VERSION"
