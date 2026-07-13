@@ -49,6 +49,7 @@ save_port_info 7999 "$uuid" private public a1b2c3d4 'learn.microsoft.com'
 set_port_socks5_config 7999 y 'proxy.example.com' 1080 y 'user"name' 'p@ss"word' n
 set_port_haproxy_config 7999 y 8009 2 400
 update_config_file
+[[ "$CONFIG_FILE" == *.json ]]
 jq -e '.ports[0].socks5.username == "user\"name"' "$PORT_INFO_FILE" >/dev/null
 jq -e '.inbounds[0].port == 7999' "$CONFIG_FILE" >/dev/null
 jq -e '.outbounds[] | select(.tag == "socks5-out-7999") | .settings.servers[0].users[0].pass == "p@ss\"word"' "$CONFIG_FILE" >/dev/null

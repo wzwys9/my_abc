@@ -2,7 +2,7 @@
 
 # ============================================================
 # Xray 多端口管理脚本 - 重构版
-# 版本: 3.0.2
+# 版本: 3.0.3
 # ============================================================
 
 # 等待1秒, 避免curl下载脚本的打印与脚本本身的显示冲突
@@ -23,7 +23,7 @@ readonly CYAN='\e[96m'
 readonly NONE='\e[0m'
 
 # 脚本版本
-readonly VERSION="3.0.2"
+readonly VERSION="3.0.3"
 
 # 配置文件路径
 readonly CONFIG_FILE="/usr/local/etc/xray/config.json"
@@ -541,7 +541,8 @@ build_socks5_outbound() {
 update_config_file() {
     mkdir -p "$CONFIG_DIR"
     local temp_config
-    temp_config=$(mktemp "${CONFIG_DIR}/.config.json.tmp.XXXXXX") || return 1
+    # Xray根据文件扩展名识别格式，临时文件必须以.json结尾
+    temp_config=$(mktemp "${CONFIG_DIR}/.config.tmp.XXXXXX.json") || return 1
 
     # 始终先在临时文件中完整生成，验证成功后才替换线上配置
     cat > "$temp_config" << 'EOL'
@@ -826,11 +827,32 @@ find_available_port() {
 # 配置SOCKS5代理
 configure_socks5() {
     local port=$1
+    local port_info current_socks current_haproxy
+    local default_address="" default_port="" default_auth="n"
+    local default_user="" default_pass="" default_udp="n"
     local socks5_address socks5_port auth_needed socks5_user socks5_pass udp_over_tcp
+
+    # 修改已有配置时，回车沿用上一次的值
+    port_info=$(get_port_info "$port")
+    current_socks=$(echo "$port_info" | jq -c '.socks5 // null')
+    current_haproxy=$(echo "$port_info" | jq -c '.haproxy // null')
+    if [[ "$current_socks" != "null" && "$(echo "$current_socks" | jq -r '.enabled // false')" == "true" ]]; then
+        default_address=$(echo "$current_socks" | jq -r '.address // ""')
+        default_port=$(echo "$current_socks" | jq -r '.port // ""')
+        [[ "$(echo "$current_socks" | jq -r '.auth_needed // false')" == "true" ]] && default_auth="y"
+        default_user=$(echo "$current_socks" | jq -r '.username // ""')
+        default_pass=$(echo "$current_socks" | jq -r '.password // ""')
+        [[ "$(echo "$current_socks" | jq -r '.udp_over_tcp // false')" == "true" ]] && default_udp="y"
+    fi
 
     # 获取SOCKS5地址
     while :; do
-        read -p "请输入 SOCKS5 服务器地址: " socks5_address
+        if [[ -n "$default_address" ]]; then
+            read -r -p "$(echo -e "请输入 SOCKS5 服务器地址 (当前: ${CYAN}${default_address}${NONE}): ")" socks5_address
+            [[ -z "$socks5_address" ]] && socks5_address=$default_address
+        else
+            read -r -p "请输入 SOCKS5 服务器地址: " socks5_address
+        fi
         if ! validate_proxy_host "$socks5_address"; then
             echo -e "${RED}错误: 请输入合法的IP地址或主机名${NONE}"
             continue
@@ -844,27 +866,41 @@ configure_socks5() {
 
     # 获取SOCKS5端口
     while :; do
-        read -p "请输入 SOCKS5 端口: " socks5_port
+        if [[ -n "$default_port" ]]; then
+            read -r -p "$(echo -e "请输入 SOCKS5 端口 (当前: ${CYAN}${default_port}${NONE}): ")" socks5_port
+            [[ -z "$socks5_port" ]] && socks5_port=$default_port
+        else
+            read -r -p "请输入 SOCKS5 端口: " socks5_port
+        fi
         if ! validate_port "$socks5_port"; then
             msg_error; continue
         fi
         break
     done
 
-    # 认证设置
-    read_yes_no "是否需要用户名密码认证?" "n" && auth_needed="y" || auth_needed="n"
+    # 认证设置；修改时默认保持当前状态
+    read_yes_no "是否需要用户名密码认证?" "$default_auth" && auth_needed="y" || auth_needed="n"
     if [[ "$auth_needed" == "y" ]]; then
-        read -r -p "请输入用户名: " socks5_user
-        read -r -p "请输入密码: " socks5_pass
+        read -r -p "$(echo -e "请输入用户名$([[ -n "$default_user" ]] && echo " (当前: ${CYAN}${default_user}${NONE})"): ")" socks5_user
+        [[ -z "$socks5_user" ]] && socks5_user=$default_user
+        read -r -p "$(echo -e "请输入密码$([[ -n "$default_pass" ]] && echo " (当前: ${CYAN}${default_pass}${NONE})"): ")" socks5_pass
+        [[ -z "$socks5_pass" ]] && socks5_pass=$default_pass
+        if [[ -z "$socks5_user" || -z "$socks5_pass" ]]; then
+            echo -e "${RED}启用认证时用户名和密码不能为空${NONE}"
+            return 1
+        fi
+    else
+        socks5_user=""
+        socks5_pass=""
     fi
 
-    # UDP设置
-    read_yes_no "是否启用 UDP over TCP?" "n" && udp_over_tcp="y" || udp_over_tcp="n"
+    # UDP设置；修改时默认保持当前状态
+    read_yes_no "是否启用 UDP over TCP?" "$default_udp" && udp_over_tcp="y" || udp_over_tcp="n"
 
     # 保存SOCKS5配置
-    set_port_socks5_config "$port" "y" "$socks5_address" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp"
+    set_port_socks5_config "$port" "y" "$socks5_address" "$socks5_port" "$auth_needed" "$socks5_user" "$socks5_pass" "$udp_over_tcp" || return 1
 
-    # 自动配置HAProxy
+    # 自动配置HAProxy；修改SOCKS5时保留已有HAProxy端口和参数
     if ! command -v haproxy >/dev/null 2>&1; then
         msg_info "正在安装HAProxy..."
         apt-get update && apt-get install -y haproxy || {
@@ -873,13 +909,21 @@ configure_socks5() {
         }
         systemctl enable haproxy >/dev/null 2>&1 || true
     fi
-    local haproxy_port
-    haproxy_port=$(find_available_port $((port + 10))) || {
-        echo -e "${RED}未找到可用的HAProxy端口${NONE}"
-        return 1
-    }
-    set_port_haproxy_config "$port" "y" "$haproxy_port" 12 400
-    update_haproxy_config
+
+    local haproxy_port haproxy_threads=12 haproxy_maxconn=400
+    if [[ "$current_haproxy" != "null" && "$(echo "$current_haproxy" | jq -r '.enabled // false')" == "true" ]]; then
+        haproxy_port=$(echo "$current_haproxy" | jq -r '.port')
+        haproxy_threads=$(echo "$current_haproxy" | jq -r '.threads // 12')
+        haproxy_maxconn=$(echo "$current_haproxy" | jq -r '.maxconn // 400')
+    else
+        haproxy_port=$(find_available_port $((port + 10))) || {
+            echo -e "${RED}未找到可用的HAProxy端口${NONE}"
+            return 1
+        }
+    fi
+
+    set_port_haproxy_config "$port" "y" "$haproxy_port" "$haproxy_threads" "$haproxy_maxconn" || return 1
+    update_haproxy_config || return 1
 
     echo -e "${GREEN}SOCKS5和HAProxy配置完成，HAProxy端口: $haproxy_port${NONE}"
     log_info "为端口 $port 配置SOCKS5代理"
@@ -1041,11 +1085,11 @@ modify_port_configuration() {
     read -p "$(echo -e "请选择 [${GREEN}0-5${NONE}]: ")" choice
 
     case $choice in
-        1) modify_port_uuid "$port" ;;
-        2) modify_port_domain "$port" ;;
-        3) modify_port_shortid "$port" ;;
-        4) modify_port_socks5 "$port" ;;
-        5) modify_port_haproxy "$port" ;;
+        1) modify_port_uuid "$port" || return 1 ;;
+        2) modify_port_domain "$port" || return 1 ;;
+        3) modify_port_shortid "$port" || return 1 ;;
+        4) modify_port_socks5 "$port" || return 1 ;;
+        5) modify_port_haproxy "$port" || return 1 ;;
         0) return ;;
         *) msg_error; return ;;
     esac
@@ -1054,8 +1098,11 @@ modify_port_configuration() {
     local new_md5=$(jq -c '.ports' "$PORT_INFO_FILE" | md5sum | cut -d ' ' -f1)
     if [[ "$original_md5" != "$new_md5" ]]; then
         msg_info "配置已更改，更新Xray配置..."
-        update_config_file
-        restart_xray
+        if ! update_config_file; then
+            echo -e "${RED}配置验证失败，未重启Xray${NONE}"
+            return 1
+        fi
+        restart_xray || return 1
 
         local port_info=$(get_port_info "$port")
         generate_connection_info "$port" \
@@ -1182,16 +1229,16 @@ modify_port_socks5() {
             update_haproxy_config
             msg_success "SOCKS5代理已禁用!"
         else
-            configure_socks5 "$port"
+            configure_socks5 "$port" || return 1
         fi
     else
         echo -e "当前状态: ${RED}未启用${NONE}"
         if read_yes_no "是否启用SOCKS5代理?" "n"; then
-            configure_socks5 "$port"
+            configure_socks5 "$port" || return 1
         fi
     fi
 
-    update_config_file
+    update_config_file || return 1
 }
 
 # 修改HAProxy设置
